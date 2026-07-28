@@ -1,0 +1,18 @@
+# Normalise line endings on commit; check out native.
+* text=auto
+
+# Always LF — these are executed or parsed by tools that care.
+*.ts      text eol=lf
+*.js      text eol=lf
+*.json    text eol=lf
+*.md      text eol=lf
+*.yml     text eol=lf
+*.sh      text eol=lf
+
+# Windows-native.
+*.ps1     text eol=crlf
+
+# Binary.
+*.png     binary
+*.jpg     binary
+*.ico     binary

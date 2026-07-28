@@ -1,0 +1,71 @@
+{
+  "name": "omocop-m365",
+  "version": "1.0.0",
+  "description": "An opinionated Microsoft 365 MCP server that signs in as a dedicated agent account, not yours",
+  "type": "module",
+  "main": "./dist/index.js",
+  "bin": {
+    "omocop-m365": "./dist/index.js",
+    "omocop-m365-auth": "./dist/auth/server.js"
+  },
+  "files": [
+    "dist",
+    "skills",
+    "docs",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/index.js",
+    "auth": "node dist/auth/server.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src test",
+    "inspect": "npm run build && npx @modelcontextprotocol/inspector node dist/index.js",
+    "smoke": "npm run build && node scripts/smoke.mjs",
+    "verify": "npm run lint && npm run typecheck && npm test && npm run smoke"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "microsoft-365",
+    "microsoft-graph",
+    "outlook",
+    "calendar",
+    "email",
+    "claude"
+  ],
+  "author": "Tamás Deme",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tomzorz/omocop-m365.git"
+  },
+  "bugs": {
+    "url": "https://github.com/tomzorz/omocop-m365/issues"
+  },
+  "homepage": "https://github.com/tomzorz/omocop-m365#readme",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "dotenv": "^16.5.0",
+    "turndown": "^7.2.4",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/turndown": "^5.0.6",
+    "eslint": "^9.17.0",
+    "typescript": "^5.7.2",
+    "typescript-eslint": "^8.18.0",
+    "vitest": "^4.1.10"
+  },
+  "overrides": {
+    "brace-expansion": "^5.0.8"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
