@@ -1,7 +1,7 @@
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { IncomingMessage, Server as HttpServer, ServerResponse } from 'node:http';
+import { createServer, type IncomingMessage, type Server as HttpServer, type ServerResponse } from 'node:http';
 import { afterEach, beforeEach, describe, expect, test } from 'vitest';
 import { AuthServer, createPkcePair, escapeHtml, safeEquals } from '../../src/auth/server.js';
 import { TokenStore, type StoredTokens } from '../../src/auth/token-store.js';
@@ -299,15 +299,38 @@ describe('routing', () => {
 
 describe('listen', () => {
   /**
+   * A fixed port cannot be bound reliably on Windows: WinNAT reserves shifting
+   * exclusion ranges, and a port inside one fails with EACCES. The OS assigns
+   * a free one instead — the claim under test is the interface, not the port.
+   */
+  const freePort = (): Promise<number> =>
+    new Promise((resolve, reject) => {
+      const probe = createServer();
+      probe.once('error', reject);
+      probe.listen(0, '127.0.0.1', () => {
+        const address = probe.address();
+        if (typeof address === 'object' && address) probe.close(() => resolve(address.port));
+        else probe.close(() => reject(new Error('probe reported no address')));
+      });
+    });
+
+  /**
    * This server exchanges authorization codes for tokens; bound to all
    * interfaces it would be reachable from the local network.
    */
   test('binds to the loopback interface only', async () => {
-    const server = new AuthServer(config, silent, store);
+    const port = await freePort();
+    const bound = loadConfig({
+      M365_CLIENT_ID: 'cid',
+      M365_CLIENT_SECRET: 'sec',
+      M365_TOKEN_STORE: join(dir, 'tokens.json'),
+      M365_AUTH_PORT: String(port),
+    });
+    const server = new AuthServer(bound, silent, store);
     await server.listen();
     try {
       const address = (server as unknown as { server: HttpServer }).server.address();
-      expect(address).toMatchObject({ address: '127.0.0.1', port: 3999 });
+      expect(address).toMatchObject({ address: '127.0.0.1', port });
     } finally {
       await server.close();
     }

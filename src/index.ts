@@ -15,11 +15,7 @@ import { GraphClient } from './graph/client.js';
 import { TokenStore } from './auth/token-store.js';
 import { registerTools, type AnyToolDefinition } from './server/registry.js';
 import type { ToolContext } from './server/tool.js';
-import { authTools } from './tools/auth.js';
-import { calendarTools } from './tools/calendar.js';
-import { emailTools } from './tools/email.js';
-import { attachmentTools } from './tools/attachments.js';
-import { folderTools } from './tools/folders.js';
+import { allTools } from './tools/all.js';
 
 const SERVER_NAME = 'omocop-m365';
 const SERVER_VERSION = '1.0.0';
@@ -39,13 +35,7 @@ export async function main(): Promise<void> {
 
   const context: ToolContext = { graph, config, logger, resolved: new Map() };
 
-  const tools: AnyToolDefinition[] = [
-    ...authTools(store),
-    ...calendarTools,
-    ...emailTools,
-    ...attachmentTools,
-    ...folderTools,
-  ];
+  const tools: AnyToolDefinition[] = allTools(store);
 
   // Knowing what was granted lets a tool that cannot work say so without
   // spending a round trip to be refused. Before the first sign-in this is

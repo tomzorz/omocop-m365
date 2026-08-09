@@ -38,4 +38,10 @@ export default tseslint.config(
     files: ['src/logging.ts', 'test/logging.test.ts'],
     rules: { 'no-console': 'off' },
   },
+  {
+    // CLI stdout is a product surface, not the MCP transport: the console ban
+    // protects a JSON-RPC stream the CLI does not carry. Only src/cli/.
+    files: ['src/cli/**/*.ts'],
+    rules: { 'no-console': 'off' },
+  },
 );

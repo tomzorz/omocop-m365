@@ -54,7 +54,43 @@ const check = (ok, description) => {
   process.stderr.write(`${ok ? 'ok  ' : 'FAIL'}  ${description}\n`);
 };
 
-setTimeout(() => {
+/**
+ * Spawns the built CLI once. The CLI checks below prove what unit tests cannot:
+ * the bin actually dispatches, exits with the promised codes, and keeps its
+ * stdout/stderr split when run as a real process.
+ */
+const runCliOnce = (args) =>
+  new Promise((resolve) => {
+    const cli = spawn(process.execPath, ['dist/cli/index.js', ...args], {
+      env: {
+        ...process.env,
+        M365_CLIENT_ID: 'smoke-test',
+        M365_TOKEN_STORE: 'smoke-test-nonexistent.json',
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let out = '';
+    let err = '';
+    cli.stdout.on('data', (chunk) => (out += chunk));
+    cli.stderr.on('data', (chunk) => (err += chunk));
+    cli.on('close', (code) => resolve({ code, out, err }));
+  });
+
+async function cliChecks() {
+  const help = await runCliOnce(['--help']);
+  check(help.code === 0, 'cli --help exits 0');
+  for (const name of ['auth', 'check-auth-status', 'list-emails', 'list-events']) {
+    check(help.out.includes(name), `cli --help lists ${name}`);
+  }
+  check(!/^\s{2}authenticate\b/m.test(help.out), 'cli --help hides the authenticate tool');
+
+  const unknown = await runCliOnce(['frobnicate']);
+  check(unknown.code === 2, 'cli unknown subcommand exits 2');
+  check(unknown.err.includes('frobnicate'), 'cli unknown subcommand names itself on stderr');
+  check(unknown.out === '', 'cli unknown subcommand writes nothing to stdout');
+}
+
+setTimeout(async () => {
   child.kill();
 
   const lines = stdout.trim().split('\n').filter(Boolean);
@@ -91,6 +127,8 @@ setTimeout(() => {
     'every tool advertises a description',
   );
   check(stderr.includes('ready with'), 'startup was logged to stderr');
+
+  await cliChecks();
 
   if (failures.length > 0) {
     process.stderr.write(`\n${failures.length} check(s) failed\n`);

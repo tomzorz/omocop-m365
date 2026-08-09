@@ -5,7 +5,7 @@
   "type": "module",
   "main": "./dist/index.js",
   "bin": {
-    "omocop-m365": "./dist/index.js",
+    "omocop-m365": "./dist/cli/index.js",
     "omocop-m365-auth": "./dist/auth/server.js"
   },
   "files": [
