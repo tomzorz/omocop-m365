@@ -65,7 +65,7 @@ npm run auth
 
 ## 4. Register the server with your MCP client
 
-The single most common setup failure: an MCP server is launched by its client, not by a shell. It does not inherit your environment and does not read `.env`; that file configures `npm run auth` only. Credentials must go in the client configuration's `env` block.
+The single most common setup failure: an MCP server is launched by its client, not by a shell. It does not inherit your environment and does not read `.env`; that file feeds `npm run auth` and the CLI, never the server. Credentials for the server must go in the client configuration's `env` block.
 
 For **Claude Code**, either `claude mcp add omocop-m365 --env ... -- node <path>/dist/index.js`, or add to the `mcpServers` object of your configuration:
 
@@ -109,6 +109,10 @@ If you would rather substitute by hand, the tokens are:
 | `{{AGENT_MAILBOX}}` | The agent account's address |
 | `{{DOWNLOAD_DIR}}` | Where attachment downloads default to |
 | `{{MCP_SERVER_NAME}}` | The registration key from step 4 |
+
+## 6. Optional: the CLI
+
+The package also installs an `omocop-m365` binary: every tool as a subcommand, every input field as a kebab-case flag, `--help` throughout. It reads `.env` (your shell environment wins), outputs JSON by default with `--format text` and `--format md` alternatives, and runs the exact same scope gating and policies as the server. `omocop-m365 auth` is equivalent to `npm run auth`. See the README for examples.
 
 ## Troubleshooting
 

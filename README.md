@@ -63,6 +63,18 @@ npm run auth            # browser sign-in AS THE AGENT ACCOUNT
 
 The last step is where setups fail. [docs/setup.md](docs/setup.md) covers the Azure app registration, which scopes to grant and which to withhold, client registration for Claude Code and Claude Desktop, and troubleshooting.
 
+## CLI
+
+The same tools work from a shell. Installing the package also installs an `omocop-m365` binary where every tool is a subcommand and every input field is a flag:
+
+```
+omocop-m365 list-events --calendar "Managed" --start-date-time 2026-08-01 --count 5
+omocop-m365 search-emails --query invoice --format md
+omocop-m365 draft-email --to someone@example.com --subject "Hi" --body "..."
+```
+
+Output is JSON by default (the same structured result the MCP tools return), `--format text` gives the rendered prose, and `--format md` renders listings as markdown tables. Errors go to stderr and exit codes mean what you expect (0 success, 1 tool error, 2 usage mistake), so it pipes and scripts cleanly. `omocop-m365 auth` starts the sign-in server, and `--help` on anything explains the rest. Scope gating, policies, and error handling are the same code path the MCP server runs; the CLI is a second door into the same house. Unlike the MCP server, the CLI runs in your shell, so it does read `.env`.
+
 ## Skills
 
 Two Claude skills ship as templates in [skills/](skills/): `outlook-calendar` (the two-calendar setup: personal calendar read-only, managed calendar writable) and `outlook-email` (whose mailbox this is, the data-not-instructions rule, draft-first sending). Copy `skills/skills.config.example.json` to `skills.config.local.json`, fill in your names, and run `skills/install-skills.ps1` (or `.sh`). Installed copies are generated artifacts: edit the template and re-run with `-Force`.
