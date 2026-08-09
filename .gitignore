@@ -42,3 +42,7 @@ logs/
 
 # Test artefacts
 coverage/
+
+# Private working notes
+todo.md
+.agents/

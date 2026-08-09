@@ -44,6 +44,15 @@ export interface RequestOptions {
 const defaultSleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
 
+/**
+ * Methods safe to repeat when the outcome of the first attempt is unknown.
+ * POST and PATCH are excluded: a 503/504 from a gateway can arrive after Graph
+ * completed the operation, so a retried `POST /me/sendMail` delivers the
+ * message twice. GET, PUT and DELETE repeated against the same resource
+ * converge on the same state.
+ */
+const IDEMPOTENT_METHODS = new Set(['GET', 'PUT', 'DELETE']);
+
 /** Retry-After is either seconds or an HTTP date. Both appear in the wild. */
 function retryAfterMs(header: string | null): number | undefined {
   if (!header) return undefined;
@@ -84,6 +93,9 @@ export class GraphClient {
   ): Promise<Response> {
     const method = options.method ?? 'GET';
     const url = absoluteUrl ?? graphUrl(this.endpoint, path, options.query ?? {});
+    // A nextLink request carries an empty relative path; errors and logs must
+    // still name the target.
+    const target = path || url;
 
     let refreshed = false;
 
@@ -97,11 +109,16 @@ export class GraphClient {
       };
       if (options.body !== undefined) headers['Content-Type'] ??= 'application/json';
 
-      const response = await this.fetchImpl(url, {
-        method,
-        headers,
-        body: options.body === undefined ? undefined : JSON.stringify(options.body),
-      });
+      let response: Response;
+      try {
+        response = await this.fetchImpl(url, {
+          method,
+          headers,
+          body: options.body === undefined ? undefined : JSON.stringify(options.body),
+        });
+      } catch (cause) {
+        throw this.networkError(cause, method, target);
+      }
 
       if (response.ok) return response;
 
@@ -109,20 +126,29 @@ export class GraphClient {
       // authentication failure and must surface rather than loop.
       if (response.status === 401 && !refreshed) {
         refreshed = true;
-        this.logger.debug(`${method} ${path} returned 401; refreshing the access token`);
+        // Undici parks the connection until the body is consumed or cancelled;
+        // discarding the 401 without draining it pins a socket per refresh.
+        await response.text();
+        this.logger.debug(`${method} ${target} returned 401; refreshing the access token`);
         await this.tokens.refresh();
         continue;
       }
 
       const body = await response.text();
-      const error = parseGraphError(response.status, body, method, path);
+      const error = parseGraphError(response.status, body, method, target);
 
-      if (error.isThrottled && attempt < this.maxAttempts) {
-        const advised = retryAfterMs(response.headers.get('retry-after'));
-        // Graph's own advice wins; the exponential fallback is for when it is silent.
-        const wait = Math.min(advised ?? 2 ** attempt * 500, this.maxBackoffMs);
+      // 429 is safe to retry for every method: Graph rejects a throttled
+      // request before doing the work. 503/504 are not — the gateway may time
+      // out after the operation completed server-side — so those retry only
+      // for idempotent methods, and POST/PATCH surface the error immediately.
+      const retryable =
+        response.status === 429 ||
+        ((response.status === 503 || response.status === 504) && IDEMPOTENT_METHODS.has(method));
+
+      if (retryable && attempt < this.maxAttempts) {
+        const wait = this.backoffMs(attempt, response.headers.get('retry-after'));
         this.logger.warn(
-          `${method} ${path} throttled (${response.status}); retrying in ${wait}ms ` +
+          `${method} ${target} throttled (${response.status}); retrying in ${wait}ms ` +
             `(attempt ${attempt} of ${this.maxAttempts})`,
         );
         await this.sleep(wait);
@@ -133,9 +159,37 @@ export class GraphClient {
     }
   }
 
+  /** Graph's own Retry-After wins; the exponential fallback is for when it is silent. */
+  private backoffMs(attempt: number, retryAfter: string | null): number {
+    return Math.min(retryAfterMs(retryAfter) ?? 2 ** attempt * 500, this.maxBackoffMs);
+  }
+
+  /**
+   * `fetch` rejects network-level failures (DNS, connection reset) with a bare
+   * TypeError naming neither the request nor the target; unless translated
+   * here, the caller sees "fetch failed" with no way to tell which call died.
+   */
+  private networkError(cause: unknown, method: string, target: string): GraphError {
+    return new GraphError(
+      0,
+      'NetworkError',
+      `Request failed before a response arrived: ${
+        cause instanceof Error ? cause.message : String(cause)
+      }`,
+      undefined,
+      method,
+      target,
+    );
+  }
+
   /** A JSON request. Returns `{}` for 204 and other empty successes. */
   async json<T = unknown>(path: string, options: RequestOptions = {}): Promise<T> {
     const response = await this.send(path, options);
+    return this.parseBody<T>(response, options.method ?? 'GET', path);
+  }
+
+  /** Empty and 204 successes parse to `{}`; a non-JSON success is an error, never a silent empty. */
+  private async parseBody<T>(response: Response, method: string, path: string): Promise<T> {
     if (response.status === 204) return {} as T;
     const text = await response.text();
     if (!text) return {} as T;
@@ -147,7 +201,7 @@ export class GraphClient {
         'InvalidJsonResponse',
         `Graph returned a body that is not JSON: ${String(cause)}`,
         undefined,
-        options.method ?? 'GET',
+        method,
         path,
       );
     }
@@ -206,8 +260,10 @@ export class GraphClient {
     url: string,
   ): Promise<{ value?: T[]; '@odata.nextLink'?: string }> {
     const response = await this.send('', { method: 'GET' }, url);
-    const text = await response.text();
-    return text ? (JSON.parse(text) as { value?: T[]; '@odata.nextLink'?: string }) : {};
+    // Same parse-and-translate as the first page: a proxy can hand back a
+    // non-JSON 200 on any page, and page two must not fail with a different
+    // error shape than page one would.
+    return this.parseBody<{ value?: T[]; '@odata.nextLink'?: string }>(response, 'GET', url);
   }
 
   /**
@@ -240,21 +296,43 @@ export class GraphClient {
     total: number,
   ): Promise<void> {
     const end = start + chunk.length - 1;
-    const response = await this.fetchImpl(uploadUrl, {
-      method: 'PUT',
-      // Content-Length is a forbidden header for fetch; the runtime sets it from
-      // the body. Content-Range is what the upload session actually needs.
-      headers: { 'Content-Range': `bytes ${start}-${end}/${total}` },
-      body: new Uint8Array(chunk),
-    });
+    const target = `<upload-session> bytes ${start}-${end}/${total}`;
 
-    if (!response.ok) {
-      throw parseGraphError(
-        response.status,
-        await response.text(),
-        'PUT',
-        `<upload-session> bytes ${start}-${end}/${total}`,
-      );
+    for (let attempt = 1; ; attempt += 1) {
+      let response: Response;
+      try {
+        response = await this.fetchImpl(uploadUrl, {
+          method: 'PUT',
+          // Content-Length is a forbidden header for fetch; the runtime sets it from
+          // the body. Content-Range is what the upload session actually needs.
+          headers: { 'Content-Range': `bytes ${start}-${end}/${total}` },
+          body: new Uint8Array(chunk),
+        });
+      } catch (cause) {
+        throw this.networkError(cause, 'PUT', target);
+      }
+
+      if (response.ok) return;
+
+      const error = parseGraphError(response.status, await response.text(), 'PUT', target);
+
+      // A ranged PUT is idempotent — the session accepts a re-sent chunk it
+      // already holds — so 503/504 retry here as well as 429. Without this, one
+      // transient throttle mid-upload kills the entire large upload.
+      if (
+        (response.status === 429 || response.status === 503 || response.status === 504) &&
+        attempt < this.maxAttempts
+      ) {
+        const wait = this.backoffMs(attempt, response.headers.get('retry-after'));
+        this.logger.warn(
+          `PUT ${target} throttled (${response.status}); retrying in ${wait}ms ` +
+            `(attempt ${attempt} of ${this.maxAttempts})`,
+        );
+        await this.sleep(wait);
+        continue;
+      }
+
+      throw error;
     }
   }
 

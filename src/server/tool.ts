@@ -171,7 +171,10 @@ export async function runTool<In extends ZodRawShape, Out extends ZodRawShape>(
       );
     }
 
-    return ok(definition.render(data), parsed.data as Record<string, unknown>);
+    // Render from the parsed data, not the raw handler output: parsing strips
+    // extra keys and applies defaults, and the text must describe exactly what
+    // the structured content carries.
+    return ok(definition.render(parsed.data as Infer<Out>), parsed.data as Record<string, unknown>);
   } catch (error) {
     if (error instanceof AuthenticationRequiredError) return fail(error.message);
 

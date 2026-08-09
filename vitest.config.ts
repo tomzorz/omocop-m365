@@ -7,10 +7,5 @@ export default defineConfig({
     // Tests reach into the real filesystem for attachment round-trips, so they
     // must not share a working directory.
     pool: 'forks',
-    coverage: {
-      provider: 'v8',
-      include: ['src/**/*.ts'],
-      exclude: ['src/**/*.d.ts'],
-    },
   },
 });

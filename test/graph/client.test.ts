@@ -3,27 +3,45 @@ import { GraphClient, type TokenProvider } from '../../src/graph/client.js';
 import { GraphError } from '../../src/graph/errors.js';
 import { createLogger } from '../../src/logging.js';
 
+/** What one queued fake response looks like; plain data, not a real Response. */
+interface FakeResponseSpec {
+  readonly status?: number;
+  readonly headers?: Record<string, string>;
+  readonly bodyText?: string;
+}
+
 /** A queue-driven fetch stand-in that records what it was asked for. */
-function fakeFetch(responses: Array<Partial<Response> & { bodyText?: string }>) {
+function fakeFetch(responses: FakeResponseSpec[]) {
   const calls: Array<{ url: string; init: RequestInit }> = [];
+  /** Whether each response's body has been consumed, indexed by call order. */
+  const drained: boolean[] = [];
   let i = 0;
 
   const impl = (async (url: string | URL, init: RequestInit = {}) => {
     calls.push({ url: String(url), init });
+    const index = drained.length;
+    drained.push(false);
     const spec = responses[Math.min(i, responses.length - 1)];
     i += 1;
     const status = spec?.status ?? 200;
     const body = spec?.bodyText ?? '';
+    // Real undici bodies are one-shot streams: a second read throws. The fake
+    // enforces that so a double read fails in tests, not only in production.
+    const readOnce = () => {
+      if (drained[index]) throw new TypeError('Body is unusable: Body has already been read');
+      drained[index] = true;
+      return body;
+    };
     return {
       ok: status >= 200 && status < 300,
       status,
-      headers: new Headers((spec?.headers as HeadersInit) ?? {}),
-      text: async () => body,
-      arrayBuffer: async () => new TextEncoder().encode(body).buffer,
+      headers: new Headers(spec?.headers ?? {}),
+      text: async () => readOnce(),
+      arrayBuffer: async () => new TextEncoder().encode(readOnce()).buffer,
     } as unknown as Response;
   }) as unknown as typeof fetch;
 
-  return { impl, calls, count: () => i };
+  return { impl, calls, count: () => i, drained };
 }
 
 function makeTokens(): TokenProvider & { refreshes: number } {
@@ -97,6 +115,16 @@ describe('authentication', () => {
       .toBe('Bearer token-1');
   });
 
+  test('drains the discarded 401 body so undici can reuse the connection', async () => {
+    const f = fakeFetch([
+      { status: 401, bodyText: '{"error":{"code":"InvalidAuthenticationToken"}}' },
+      { status: 200, bodyText: '{"ok":true}' },
+    ]);
+
+    await client(f.impl).get('me');
+    expect(f.drained[0]).toBe(true);
+  });
+
   test('surfaces a second 401 rather than looping', async () => {
     const f = fakeFetch([
       { status: 401, bodyText: '{"error":{"code":"X","message":"bad token"}}' },
@@ -153,6 +181,82 @@ describe('throttling', () => {
 
     await expect(c.get('me')).rejects.toMatchObject({ status: 429 });
     expect(f.count()).toBe(3);
+  });
+});
+
+/**
+ * A 429 means Graph refused the request before doing the work, so every method
+ * may retry it. A 503/504 can arrive after the operation completed server-side,
+ * so only idempotent methods may retry those — a retried sendMail is a double
+ * send.
+ */
+describe('retry safety by method', () => {
+  test('POST is not retried on 503 even though a retry would have succeeded', async () => {
+    const f = fakeFetch([
+      { status: 503, bodyText: '{}' },
+      { status: 200, bodyText: '{}' },
+    ]);
+
+    await expect(client(f.impl).post('me/sendMail', {})).rejects.toMatchObject({ status: 503 });
+    expect(f.count()).toBe(1);
+  });
+
+  test('PATCH is not retried on 504', async () => {
+    const f = fakeFetch([
+      { status: 504, bodyText: '{}' },
+      { status: 200, bodyText: '{}' },
+    ]);
+
+    await expect(client(f.impl).patch('me/events/1', {})).rejects.toMatchObject({ status: 504 });
+    expect(f.count()).toBe(1);
+  });
+
+  test('POST is retried on 429', async () => {
+    const f = fakeFetch([
+      { status: 429, headers: { 'retry-after': '1' }, bodyText: '{}' },
+      { status: 202, bodyText: '' },
+    ]);
+
+    await expect(client(f.impl).post('me/sendMail', {})).resolves.toEqual({});
+    expect(f.count()).toBe(2);
+  });
+
+  test('GET is retried on 503', async () => {
+    const f = fakeFetch([
+      { status: 503, bodyText: '{}' },
+      { status: 200, bodyText: '{"ok":1}' },
+    ]);
+
+    await expect(client(f.impl).get('me')).resolves.toEqual({ ok: 1 });
+    expect(f.count()).toBe(2);
+  });
+});
+
+describe('network failures', () => {
+  test('a fetch rejection is translated and carries method and path', async () => {
+    const impl = (async () => {
+      throw new TypeError('fetch failed');
+    }) as unknown as typeof fetch;
+
+    const error = await client(impl)
+      .get('me/messages')
+      .catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(GraphError);
+    expect(error).toMatchObject({ method: 'GET', path: 'me/messages' });
+    expect((error as Error).message).toContain('fetch failed');
+  });
+
+  test('an upload-session fetch rejection is translated the same way', async () => {
+    const impl = (async () => {
+      throw new TypeError('fetch failed');
+    }) as unknown as typeof fetch;
+
+    const error = await client(impl)
+      .uploadChunk('https://upload.test/s', Buffer.alloc(10), 0, 10)
+      .catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(GraphError);
+    expect(error).toMatchObject({ method: 'PUT' });
+    expect((error as Error).message).toContain('fetch failed');
   });
 });
 
@@ -224,6 +328,18 @@ describe('pagination', () => {
     expect(items).toEqual([1]);
     expect(truncated).toBe(false);
   });
+
+  test('a non-JSON second page fails with the same translated error as a first page would', async () => {
+    const f = fakeFetch([
+      { status: 200, bodyText: '{"value":[1],"@odata.nextLink":"https://graph.test/p2"}' },
+      { status: 200, bodyText: 'not json at all' },
+    ]);
+
+    await expect(client(f.impl).collect<number>('me/m')).rejects.toMatchObject({
+      code: 'InvalidJsonResponse',
+      path: 'https://graph.test/p2',
+    });
+  });
 });
 
 describe('binary and uploads', () => {
@@ -248,5 +364,33 @@ describe('binary and uploads', () => {
     await expect(
       client(f.impl).uploadChunk('https://upload.test/s', Buffer.alloc(10), 5, 20),
     ).rejects.toMatchObject({ status: 416 });
+    // 416 is not transient; one attempt only.
+    expect(f.count()).toBe(1);
+  });
+
+  test('uploadChunk retries a throttled chunk, honouring Retry-After', async () => {
+    const waits: number[] = [];
+    const f = fakeFetch([
+      { status: 429, headers: { 'retry-after': '3' }, bodyText: '{}' },
+      { status: 202, bodyText: '{}' },
+    ]);
+
+    await client(f.impl, { sleep: async (ms: number) => void waits.push(ms) }).uploadChunk(
+      'https://upload.test/s',
+      Buffer.alloc(10),
+      0,
+      10,
+    );
+    expect(f.count()).toBe(2);
+    expect(waits).toEqual([3000]);
+  });
+
+  test('uploadChunk retries 503 (a ranged PUT is idempotent) and gives up after maxAttempts', async () => {
+    const f = fakeFetch([{ status: 503, bodyText: '{}' }]);
+
+    await expect(
+      client(f.impl, { maxAttempts: 2 }).uploadChunk('https://upload.test/s', Buffer.alloc(1), 0, 1),
+    ).rejects.toMatchObject({ status: 503 });
+    expect(f.count()).toBe(2);
   });
 });

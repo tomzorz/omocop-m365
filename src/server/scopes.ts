@@ -16,22 +16,25 @@ export function normaliseScope(scope: string): string {
 }
 
 /**
- * Scopes implied by holding another. `X.ReadWrite` covers `X.Read`, so a tool
- * declaring the narrower form is satisfied by the wider grant.
+ * Scopes implied by holding another, following Graph's containment chain:
+ * `X.ReadWrite.All` ⊇ `X.Read.All`, `X.ReadWrite`, `X.Read`;
+ * `X.Read.All` ⊇ `X.Read`; `X.ReadWrite` ⊇ `X.Read`.
+ *
+ * The suffixes are mutually exclusive — a scope ends in exactly one of them —
+ * so each branch returns and nothing can be expanded twice.
  */
 function impliedBy(granted: string): readonly string[] {
-  const implied = [granted];
-  if (granted.endsWith('.readwrite')) {
-    implied.push(granted.replace(/\.readwrite$/, '.read'));
-  }
   if (granted.endsWith('.readwrite.all')) {
-    implied.push(
-      granted.replace(/\.readwrite\.all$/, '.read.all'),
-      granted.replace(/\.readwrite\.all$/, '.readwrite'),
-      granted.replace(/\.readwrite\.all$/, '.read'),
-    );
+    const stem = granted.slice(0, -'.readwrite.all'.length);
+    return [granted, `${stem}.read.all`, `${stem}.readwrite`, `${stem}.read`];
   }
-  return implied;
+  if (granted.endsWith('.read.all')) {
+    return [granted, granted.slice(0, -'.all'.length)];
+  }
+  if (granted.endsWith('.readwrite')) {
+    return [granted, `${granted.slice(0, -'.readwrite'.length)}.read`];
+  }
+  return [granted];
 }
 
 /** Expands a granted set to everything it covers. */

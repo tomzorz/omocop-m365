@@ -1,6 +1,12 @@
 import { describe, expect, test, vi } from 'vitest';
 import { z } from 'zod';
-import { defineTool, runTool, type ToolContext, type ToolPolicy } from '../../src/server/tool.js';
+import {
+  defineTool,
+  runTool,
+  type ToolContext,
+  type ToolPolicy,
+  type ToolResult,
+} from '../../src/server/tool.js';
 import { GraphError } from '../../src/graph/errors.js';
 import { AuthenticationRequiredError } from '../../src/auth/token-store.js';
 import { loadConfig } from '../../src/config.js';
@@ -10,6 +16,13 @@ const config = loadConfig({ M365_CLIENT_ID: 'cid', M365_CLIENT_SECRET: 'sec' });
 
 /** Covers what `echo` declares, so the gate is satisfied and out of the way. */
 const GRANTED = ['Mail.ReadWrite'];
+
+/** The first content block's text; throws when the block is an image. */
+function firstText(result: ToolResult): string {
+  const block = result.content[0];
+  if (block?.type !== 'text') throw new Error('first content block is not text');
+  return block.text;
+}
 
 function context(lines: string[] = []): ToolContext {
   return {
@@ -36,7 +49,7 @@ describe('happy path', () => {
     const result = await runTool(echo, { value: 'hello' }, context(), ['Mail.ReadWrite']);
 
     expect(result.isError).toBeUndefined();
-    expect(result.content[0]?.text).toBe('Echoed "hello" (5 chars).');
+    expect(firstText(result)).toBe('Echoed "hello" (5 chars).');
     expect(result.structuredContent).toEqual({ echoed: 'hello', length: 5 });
   });
 
@@ -47,8 +60,8 @@ describe('happy path', () => {
   test('the rendered text is a function of the structured content', async () => {
     const result = await runTool(echo, { value: 'abc' }, context(), GRANTED);
     const data = result.structuredContent as { echoed: string; length: number };
-    expect(result.content[0]?.text).toContain(data.echoed);
-    expect(result.content[0]?.text).toContain(String(data.length));
+    expect(firstText(result)).toContain(data.echoed);
+    expect(firstText(result)).toContain(String(data.length));
   });
 });
 
@@ -60,8 +73,8 @@ describe('scope gating', () => {
     const result = await runTool(tool, { value: 'x' }, context(), ['Calendars.Read']);
 
     expect(result.isError).toBe(true);
-    expect(result.content[0]?.text).toContain('Mail.Read');
-    expect(result.content[0]?.text).toContain('Nothing was sent');
+    expect(firstText(result)).toContain('Mail.Read');
+    expect(firstText(result)).toContain('Nothing was sent');
     expect(handler).not.toHaveBeenCalled();
   });
 
@@ -85,7 +98,7 @@ describe('policies', () => {
     const result = await runTool(tool, { value: 'x' }, context(), GRANTED);
 
     expect(result.isError).toBe(true);
-    expect(result.content[0]?.text).toBe('you must say which one you mean');
+    expect(firstText(result)).toBe('you must say which one you mean');
     expect(handler).not.toHaveBeenCalled();
   });
 
@@ -125,7 +138,7 @@ describe('policies', () => {
     );
 
     expect(order).toEqual(['first']);
-    expect(result.content[0]?.text).toBe('first said no');
+    expect(firstText(result)).toBe('first said no');
   });
 
   test('a policy sees the parsed arguments', async () => {
@@ -145,7 +158,7 @@ describe('policies', () => {
       return { refuse: 'eventually no' };
     };
     const result = await runTool(defineTool({ ...echo, policies: [slow] }), { value: 'x' }, context(), GRANTED);
-    expect(result.content[0]?.text).toBe('eventually no');
+    expect(firstText(result)).toBe('eventually no');
   });
 });
 
@@ -161,9 +174,9 @@ describe('error translation', () => {
     const result = await runTool(tool, { value: 'x' }, context(), GRANTED);
 
     expect(result.isError).toBe(true);
-    expect(result.content[0]?.text).toContain('Access is denied.');
-    expect(result.content[0]?.text).toContain('organiser');
-    expect(result.content[0]?.text).toContain('req-9');
+    expect(firstText(result)).toContain('Access is denied.');
+    expect(firstText(result)).toContain('organiser');
+    expect(firstText(result)).toContain('req-9');
   });
 
   test('an authentication failure returns the actionable message', async () => {
@@ -175,7 +188,7 @@ describe('error translation', () => {
     });
 
     const result = await runTool(tool, { value: 'x' }, context(), GRANTED);
-    expect(result.content[0]?.text).toContain('npm run auth');
+    expect(firstText(result)).toContain('npm run auth');
   });
 
   test('an unexpected error is reported, not swallowed', async () => {
@@ -188,22 +201,30 @@ describe('error translation', () => {
 
     const result = await runTool(tool, { value: 'x' }, context(), GRANTED);
     expect(result.isError).toBe(true);
-    expect(result.content[0]?.text).toBe('something specific went wrong');
+    expect(firstText(result)).toBe('something specific went wrong');
   });
 
   test('every failure path sets isError', async () => {
+    const refusing: ToolPolicy = () => ({ refuse: 'policy said no' });
     const throwing = defineTool({
       ...echo,
       handler: async () => {
-        throw new Error('x');
+        throw new Error('handler blew up');
       },
     });
-    for (const result of [
-      await runTool(throwing, { value: 'x' }, context(), []),
-      await runTool(echo, { value: 'x' }, context(), ['Nothing.Granted']),
-    ]) {
+
+    // Three genuinely distinct paths: the gate (handler never reached), a
+    // policy refusal (handler never reached), and the handler itself throwing.
+    const failures = [
+      await runTool(echo, { value: 'x' }, context(), []),
+      await runTool(defineTool({ ...echo, policies: [refusing] }), { value: 'x' }, context(), GRANTED),
+      await runTool(throwing, { value: 'x' }, context(), GRANTED),
+    ];
+
+    for (const result of failures) {
       expect(result.isError).toBe(true);
       expect(result.structuredContent).toBeUndefined();
+      expect(firstText(result)).not.toBe('');
     }
   });
 });
@@ -219,7 +240,7 @@ describe('output validation', () => {
     const result = await runTool(tool, { value: 'x' }, context(lines), GRANTED);
 
     expect(result.isError).toBe(true);
-    expect(result.content[0]?.text).toContain('bug in the server');
+    expect(firstText(result)).toContain('bug in the server');
     expect(lines.join()).toContain('does not match its output schema');
   });
 
@@ -227,9 +248,13 @@ describe('output validation', () => {
     const tool = defineTool({
       ...echo,
       handler: async () => ({ echoed: 'x', length: 1, secret: 'should not appear' }) as never,
+      // Renders everything it is given, so a stripped key surviving into the
+      // renderer would show up in the text.
+      render: (data) => JSON.stringify(data),
     });
 
     const result = await runTool(tool, { value: 'x' }, context(), GRANTED);
     expect(result.structuredContent).toEqual({ echoed: 'x', length: 1 });
+    expect(firstText(result)).not.toContain('should not appear');
   });
 });

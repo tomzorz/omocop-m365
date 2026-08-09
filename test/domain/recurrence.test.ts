@@ -136,10 +136,24 @@ describe('recurring events with a scope', () => {
       .toEqual({ kind: 'resolved', targetId: 'master1', scope: 'series' });
   });
 
-  test('falls back to the event id when a master id is missing', () => {
-    const orphan: EventFacts = { id: 'occ9', type: 'occurrence' };
-    expect(resolveScope(orphan, 'series', 'delete'))
-      .toEqual({ kind: 'resolved', targetId: 'occ9', scope: 'series' });
+  /**
+   * An occurrence id names one date. Without the master's id there is nothing
+   * that names the series, so acting anyway would delete one occurrence while
+   * reporting the whole series gone.
+   */
+  test('series on an occurrence with no master id is refused, not narrowed', () => {
+    const orphan: EventFacts = { id: 'occ9', subject: 'Weekly standup', type: 'occurrence' };
+    const result = resolveScope(orphan, 'series', 'delete');
+    expect(result.kind).toBe('refused');
+    if (result.kind !== 'refused') return;
+    expect(result.message).toContain('seriesMasterId');
+    expect(result.message).toContain('deletes every occurrence');
+    expect(result.message).toContain('scope:"this"');
+  });
+
+  test('an exception with no master id is refused the same way', () => {
+    const orphan: EventFacts = { id: 'exc1', type: 'exception' };
+    expect(resolveScope(orphan, 'series', 'update').kind).toBe('refused');
   });
 });
 

@@ -20,11 +20,15 @@ export type DateTimeResult =
   | { readonly ok: true; readonly value: GraphDateTime }
   | { readonly ok: false; readonly message: string };
 
-/** Trailing `Z`, `+02:00`, or `-0500`. */
-const HAS_OFFSET = /([zZ]|[+-]\d{2}:?\d{2})$/;
-
-/** A naive timestamp must at least look like one before it is passed on. */
-const LOOKS_LIKE_DATETIME = /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}/;
+/**
+ * The whole value must be one ISO 8601 timestamp: date, `T` or space, time
+ * (seconds and fraction optional), then optionally an offset in any ISO form —
+ * `Z`, `+02`, `+02:00`, or `-0500`. Anchored at both ends: trailing text
+ * ("…T14:00 lunch with Bob") must be refused here, not passed to Graph to
+ * fail as an opaque 400.
+ */
+const ISO_SHAPE =
+  /^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?)(Z|[+-]\d{2}(?::?\d{2})?)?$/i;
 
 /** Accepts a bare string or Graph's own {dateTime, timeZone} shape. */
 export type DateTimeInput = string | { dateTime?: string; timeZone?: string } | undefined;
@@ -47,24 +51,51 @@ export function toGraphDateTime(
     return { ok: false, message: `${article} ${label} is required.` };
   }
 
-  if (HAS_OFFSET.test(text)) {
-    const parsed = new Date(text);
-    if (Number.isNaN(parsed.getTime())) {
-      return { ok: false, message: `"${text}" is not a valid ${label}.` };
-    }
-    // Keeping the instant exact beats honouring a named zone that contradicts it.
-    return {
-      ok: true,
-      value: { dateTime: parsed.toISOString().replace(/\.\d+Z$/, ''), timeZone: 'UTC' },
-    };
-  }
-
-  if (!LOOKS_LIKE_DATETIME.test(text)) {
+  const match = ISO_SHAPE.exec(text);
+  if (!match) {
     return {
       ok: false,
       message:
         `"${text}" is not a valid ${label}. Use ISO 8601 — 2026-08-15T14:00:00 means ` +
         `2pm in the configured timezone.`,
+    };
+  }
+  // Groups 1 and 2 are unconditional in ISO_SHAPE; only the offset is optional.
+  const [, date = '', time = '', offset] = match;
+
+  // The shape says nothing about whether the components name a real moment
+  // (month 13 fits the shape). Parsing with an explicit offset — Z standing in
+  // for a naive value, ±HH and ±HHMM widened to the ±HH:MM form Date requires —
+  // makes new Date() the validity check, with no clock or zone lookup involved.
+  const parseOffset =
+    offset === undefined || /^z$/i.test(offset)
+      ? 'Z'
+      : offset.length === 3
+        ? `${offset}:00`
+        : offset.includes(':')
+          ? offset
+          : `${offset.slice(0, 3)}:${offset.slice(3)}`;
+
+  const parsed = new Date(`${date}T${time}${parseOffset}`);
+  // NaN catches month 13 and hour 99, but V8 rolls a day past the end of its
+  // month into the next (Feb 30 parses as Mar 2), so a real date must also
+  // survive a round-trip unchanged. The check stays in the date's own frame —
+  // midnight UTC — so an offset cannot shift the day being compared.
+  const impossible =
+    Number.isNaN(parsed.getTime()) ||
+    new Date(`${date}T00:00:00Z`).toISOString().slice(0, 10) !== date;
+  if (impossible) {
+    return {
+      ok: false,
+      message: `"${text}" is not a valid ${label}: its components name no real date and time.`,
+    };
+  }
+
+  if (offset !== undefined) {
+    // Keeping the instant exact beats honouring a named zone that contradicts it.
+    return {
+      ok: true,
+      value: { dateTime: parsed.toISOString().replace(/\.\d+Z$/, ''), timeZone: 'UTC' },
     };
   }
 

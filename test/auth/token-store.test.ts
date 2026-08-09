@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, test } from 'vitest';
@@ -40,10 +40,37 @@ const validTokens = (over: Partial<StoredTokens> = {}): StoredTokens => ({
   ...over,
 });
 
-/** A token endpoint returning a queue of responses, counting calls. */
+test('refresh omits client_secret for a public-client registration', async () => {
+  const publicConfig = loadConfig({
+    M365_CLIENT_ID: 'cid',
+    M365_TOKEN_STORE: join(dir, 'tokens.json'),
+  });
+  const endpoint = tokenEndpoint([
+    { body: { access_token: 'a1', refresh_token: 'r1', expires_in: 3600 } },
+  ]);
+  const store = new TokenStore(publicConfig, silent, endpoint.impl, now);
+  await store.persist(validTokens({ expiresAt: clock - 1 }));
+  await store.getAccessToken();
+  expect(endpoint.bodies[0]).not.toContain('client_secret');
+  expect(endpoint.bodies[0]).toContain('client_id=cid');
+});
+
+test('refresh sends client_secret when one is configured', async () => {
+  const endpoint = tokenEndpoint([
+    { body: { access_token: 'a1', refresh_token: 'r1', expires_in: 3600 } },
+  ]);
+  const store = new TokenStore(config, silent, endpoint.impl, now);
+  await store.persist(validTokens({ expiresAt: clock - 1 }));
+  await store.getAccessToken();
+  expect(endpoint.bodies[0]).toContain('client_secret=secret');
+});
+
+/** A token endpoint returning a queue of responses, counting calls and recording bodies. */
 function tokenEndpoint(responses: Array<{ status?: number; body: unknown }>) {
   let i = 0;
-  const impl = (async () => {
+  const bodies: string[] = [];
+  const impl = (async (_url: unknown, init?: RequestInit) => {
+    bodies.push(String(init?.body ?? ''));
     const spec = responses[Math.min(i, responses.length - 1)];
     i += 1;
     const status = spec?.status ?? 200;
@@ -53,7 +80,7 @@ function tokenEndpoint(responses: Array<{ status?: number; body: unknown }>) {
       json: async () => spec?.body,
     } as unknown as Response;
   }) as unknown as typeof fetch;
-  return { impl, calls: () => i };
+  return { impl, calls: () => i, bodies };
 }
 
 describe('loading', () => {
@@ -93,6 +120,19 @@ describe('persist', () => {
 
     const raw = JSON.parse(await readFile(config.tokenStorePath, 'utf8')) as StoredTokens;
     expect(raw).toEqual(tokens);
+  });
+
+  test('replaces an existing store and leaves no temp file behind', async () => {
+    await writeFile(config.tokenStorePath, JSON.stringify(validTokens()));
+    const store = new TokenStore(config, silent, tokenEndpoint([]).impl, now);
+
+    await store.persist(validTokens({ accessToken: 'access-new' }));
+
+    // Write-then-rename: the only artefact allowed after persist is the store
+    // itself — a leftover temp file means the rename step was skipped.
+    expect(await readdir(dir)).toEqual(['tokens.json']);
+    const stored = JSON.parse(await readFile(config.tokenStorePath, 'utf8')) as StoredTokens;
+    expect(stored.accessToken).toBe('access-new');
   });
 });
 
@@ -189,6 +229,135 @@ describe('refresh', () => {
     const store = new TokenStore(config, silent, endpoint.impl, now);
     await expect(store.refresh()).rejects.toBeInstanceOf(AuthenticationRequiredError);
     await expect(store.refresh()).rejects.toThrow(/invalid_grant/);
+  });
+});
+
+/**
+ * The token file is shared: `npm run auth` and any second server instance write
+ * the same path, and Entra invalidates a refresh token when it rotates it. The
+ * store must treat disk, not memory, as the source of truth around a refresh.
+ */
+describe('multi-process coordination', () => {
+  test('adopts tokens another process refreshed and skips the exchange', async () => {
+    await writeFile(config.tokenStorePath, JSON.stringify(validTokens({ expiresAt: clock })));
+    const endpoint = tokenEndpoint([]);
+    const store = new TokenStore(config, silent, endpoint.impl, now);
+    // Memoise the near-expiry tokens before the other process acts.
+    expect(await store.isAuthenticated()).toBe(true);
+
+    await writeFile(
+      config.tokenStorePath,
+      JSON.stringify(validTokens({ accessToken: 'access-2', refreshToken: 'refresh-2' })),
+    );
+
+    expect(await store.getAccessToken()).toBe('access-2');
+    expect(endpoint.calls()).toBe(0);
+  });
+
+  test('exchanges with the rotated refresh token when the adopted tokens are also expiring', async () => {
+    await writeFile(config.tokenStorePath, JSON.stringify(validTokens({ expiresAt: clock })));
+    const endpoint = tokenEndpoint([{ body: { access_token: 'access-3', expires_in: 3600 } }]);
+    const store = new TokenStore(config, silent, endpoint.impl, now);
+    expect(await store.isAuthenticated()).toBe(true);
+
+    await writeFile(
+      config.tokenStorePath,
+      JSON.stringify(
+        validTokens({ accessToken: 'access-2', refreshToken: 'refresh-2', expiresAt: clock }),
+      ),
+    );
+
+    expect(await store.getAccessToken()).toBe('access-3');
+    expect(endpoint.calls()).toBe(1);
+    // The exchange must use the rotated token — the in-memory one is dead.
+    expect(endpoint.bodies[0]).toContain('refresh_token=refresh-2');
+  });
+
+  test('retries an invalid_grant once with a refresh token rotated on disk mid-flight', async () => {
+    await writeFile(config.tokenStorePath, JSON.stringify(validTokens({ expiresAt: clock })));
+
+    const bodies: string[] = [];
+    let calls = 0;
+    // The other process wins the rotation race after this store's pre-read:
+    // its write lands while our exchange is already on the wire.
+    const impl = (async (_url: unknown, init?: RequestInit) => {
+      calls += 1;
+      bodies.push(String(init?.body ?? ''));
+      if (calls === 1) {
+        await writeFile(
+          config.tokenStorePath,
+          JSON.stringify(validTokens({ refreshToken: 'refresh-1', expiresAt: clock })),
+        );
+        return {
+          ok: false,
+          status: 400,
+          json: async () => ({ error: 'invalid_grant', error_description: 'AADSTS70000: spent' }),
+        } as unknown as Response;
+      }
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          access_token: 'access-1',
+          refresh_token: 'refresh-2',
+          expires_in: 3600,
+        }),
+      } as unknown as Response;
+    }) as unknown as typeof fetch;
+
+    const store = new TokenStore(config, silent, impl, now);
+    expect(await store.refresh()).toBe('access-1');
+    expect(calls).toBe(2);
+    expect(bodies[1]).toContain('refresh_token=refresh-1');
+
+    const stored = JSON.parse(await readFile(config.tokenStorePath, 'utf8')) as StoredTokens;
+    expect(stored.refreshToken).toBe('refresh-2');
+  });
+
+  test('gives up on invalid_grant when disk holds the same refresh token', async () => {
+    await writeFile(config.tokenStorePath, JSON.stringify(validTokens({ expiresAt: clock })));
+    const endpoint = tokenEndpoint([
+      { status: 400, body: { error: 'invalid_grant', error_description: 'spent' } },
+    ]);
+
+    const store = new TokenStore(config, silent, endpoint.impl, now);
+    await expect(store.refresh()).rejects.toBeInstanceOf(AuthenticationRequiredError);
+    // Nothing new on disk means nothing worth a second exchange.
+    expect(endpoint.calls()).toBe(1);
+  });
+});
+
+/**
+ * AuthenticationRequiredError tells the user to sign in and retry. Signing in
+ * writes the token file from another process, so a retry can only succeed if
+ * the store re-reads disk instead of repeating its memoised verdict.
+ */
+describe('recovery without a restart', () => {
+  test('a sign-in after an unauthenticated failure is picked up on the next call', async () => {
+    const store = new TokenStore(config, silent, tokenEndpoint([]).impl, now);
+    await expect(store.getAccessToken()).rejects.toBeInstanceOf(AuthenticationRequiredError);
+    expect(await store.isAuthenticated()).toBe(false);
+
+    await writeFile(config.tokenStorePath, JSON.stringify(validTokens()));
+
+    expect(await store.getAccessToken()).toBe('access-0');
+    expect(await store.isAuthenticated()).toBe(true);
+  });
+
+  test('a sign-in after a failed refresh is picked up on the next call', async () => {
+    await writeFile(config.tokenStorePath, JSON.stringify(validTokens({ expiresAt: clock })));
+    const endpoint = tokenEndpoint([
+      { status: 400, body: { error: 'invalid_grant', error_description: 'expired' } },
+    ]);
+    const store = new TokenStore(config, silent, endpoint.impl, now);
+    await expect(store.getAccessToken()).rejects.toBeInstanceOf(AuthenticationRequiredError);
+
+    await writeFile(
+      config.tokenStorePath,
+      JSON.stringify(validTokens({ accessToken: 'access-9', refreshToken: 'refresh-9' })),
+    );
+
+    expect(await store.getAccessToken()).toBe('access-9');
   });
 });
 

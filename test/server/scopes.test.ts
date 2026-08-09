@@ -34,8 +34,34 @@ describe('expandGranted', () => {
     ]);
   });
 
+  test('Read.All covers Read', () => {
+    const covered = expandGranted(['Directory.Read.All']);
+    expect([...covered].sort()).toEqual(['directory.read', 'directory.read.all']);
+  });
+
   test('Read does not confer ReadWrite', () => {
     expect(expandGranted(['Mail.Read']).has('mail.readwrite')).toBe(false);
+  });
+
+  test('Read.All does not confer ReadWrite or ReadWrite.All', () => {
+    const covered = expandGranted(['Files.Read.All']);
+    expect(covered.has('files.readwrite')).toBe(false);
+    expect(covered.has('files.readwrite.all')).toBe(false);
+  });
+
+  test('ReadWrite does not confer the .All forms', () => {
+    const covered = expandGranted(['Files.ReadWrite']);
+    expect(covered.has('files.readwrite.all')).toBe(false);
+    expect(covered.has('files.read.all')).toBe(false);
+  });
+
+  test('expansion adds nothing beyond the implication chain', () => {
+    // Guards against double-expansion: each granted scope matches exactly one
+    // suffix branch, so the covered set is exactly the chain, no more.
+    expect([...expandGranted(['Mail.ReadWrite', 'Mail.ReadWrite'])].sort()).toEqual([
+      'mail.read',
+      'mail.readwrite',
+    ]);
   });
 });
 

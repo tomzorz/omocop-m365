@@ -147,6 +147,20 @@ describe('list-events', () => {
     });
     expect(text).toContain('must be after');
   });
+
+  /**
+   * Without $top Graph pages at its own default (~10), so count:50 would cost
+   * ~5 sequential round trips. $top must track the requested count.
+   */
+  test('passes the requested count to Graph as $top', async () => {
+    const { of } = await call('list-events', { count: 50 }, on('COLLECT', 'calendarView', events));
+    expect(of('COLLECT')[0]?.query?.['$top']).toBe(50);
+  });
+
+  test('defaults $top to 10 when no count was given', async () => {
+    const { of } = await call('list-events', {}, on('COLLECT', 'calendarView', events));
+    expect(of('COLLECT')[0]?.query?.['$top']).toBe(10);
+  });
 });
 
 describe('create-event', () => {
@@ -345,6 +359,21 @@ describe('update-event', () => {
     expect(of('PATCH')[0]?.body).not.toHaveProperty('recurrence');
   });
 
+  /**
+   * Read-only calendars refuse every mutating action uniformly — update is not
+   * exempt, and the refusal comes before the event facts are even fetched.
+   */
+  test('refuses a read-only calendar before fetching the event', async () => {
+    const { text, of } = await call(
+      'update-event',
+      { eventId: 'evt1', subject: 'Renamed', calendar: 'Personal' },
+      on('COLLECT', 'me/calendars', CALENDARS),
+    );
+    expect(text).toContain('read-only');
+    expect(of('GET')).toHaveLength(0);
+    expect(of('PATCH')).toHaveLength(0);
+  });
+
   test('reports how many attendees were notified', async () => {
     const { text } = await call(
       'update-event',
@@ -432,6 +461,9 @@ describe('accept-event and decline-event', () => {
     expect(of('POST')[0]?.path).toBe(`me/events/evt1/${action}`);
     expect(of('POST')[0]?.body).toMatchObject({ comment: 'ok', sendResponse: true });
     expect(text).toContain('organiser has been notified');
+    // Proper past tense — "accepted", not "acceptd" — while the structured
+    // response keeps the label verbatim.
+    expect(text).toContain(`Invitation ${label === 'accept' ? 'accepted' : 'declined'}.`);
   });
 });
 
@@ -450,5 +482,9 @@ describe('the tool set', () => {
       expect(tool(name).annotations?.destructiveHint).toBe(true);
     }
     expect(tool('list-events').annotations?.readOnlyHint).toBe(true);
+  });
+
+  test('delete-event does not claim idempotence — a repeated delete 404s', () => {
+    expect(tool('delete-event').annotations?.idempotentHint).toBeUndefined();
   });
 });

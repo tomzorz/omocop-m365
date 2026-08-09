@@ -34,7 +34,11 @@ export interface Attachment {
   readonly '@odata.type'?: string;
 }
 
-export const ATTACHMENT_SELECT = 'id,name,contentType,size,isInline,contentId';
+// contentId lives on the fileAttachment subtype, not the attachment base type,
+// so selecting it bare is a 400 against live Graph — it must be cast. The
+// response still carries it as plain `contentId`. (Verified live 2026-07-29.)
+export const ATTACHMENT_SELECT =
+  'id,name,contentType,size,isInline,microsoft.graph.fileAttachment/contentId';
 
 export const attachmentsPath = (messageId: string): string =>
   gpath`me/messages/${messageId}/attachments`;

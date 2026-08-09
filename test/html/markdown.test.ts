@@ -1,4 +1,5 @@
-import { describe, expect, test } from 'vitest';
+import { describe, expect, test, vi } from 'vitest';
+import TurndownService from 'turndown';
 import { bodyToMarkdown, htmlToMarkdown, textToMarkdown } from '../../src/html/markdown.js';
 
 describe('structure', () => {
@@ -119,6 +120,50 @@ describe('robustness', () => {
   test('malformed markup does not throw', () => {
     expect(() => htmlToMarkdown('<div><p>unclosed <b>bold</div></p>')).not.toThrow();
     expect(htmlToMarkdown('<div><p>unclosed <b>bold</div></p>').markdown).toContain('unclosed');
+  });
+
+  /**
+   * The fallback must uphold the same guarantee as the conversion it replaces:
+   * script and style content is never emitted, and no markup is either. The
+   * result may be degraded plain text; it may not be the raw body.
+   */
+  test('the fallback for a throwing conversion emits no markup or script content', () => {
+    const spy = vi
+      .spyOn(TurndownService.prototype, 'turndown')
+      .mockImplementation(() => {
+        throw new Error('conversion exploded');
+      });
+    try {
+      const { markdown } = htmlToMarkdown(
+        '<head><title>Hidden title</title></head>' +
+          '<style>.x{color:red}</style>' +
+          '<script>const SECRET_TOKEN = "abc";</script>' +
+          '<p>Visible words survive</p><a href="https://example.test">a link</a>',
+      );
+      expect(markdown).toContain('Visible words survive');
+      expect(markdown).toContain('a link');
+      expect(markdown).not.toContain('SECRET_TOKEN');
+      expect(markdown).not.toContain('color:red');
+      expect(markdown).not.toContain('Hidden title');
+      expect(markdown).not.toContain('<');
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  test('the fallback removes an unterminated script block to the end', () => {
+    const spy = vi
+      .spyOn(TurndownService.prototype, 'turndown')
+      .mockImplementation(() => {
+        throw new Error('conversion exploded');
+      });
+    try {
+      const { markdown } = htmlToMarkdown('<p>Before</p><script>leaked = true;');
+      expect(markdown).toContain('Before');
+      expect(markdown).not.toContain('leaked');
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   test('a real-world nested layout table survives', () => {

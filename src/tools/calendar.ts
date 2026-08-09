@@ -150,6 +150,9 @@ const listEvents = defineTool({
       {
         startDateTime: start.toISOString(),
         endDateTime: end.toISOString(),
+        // Without $top Graph pages at its own default (~10), so a count of 50
+        // would cost ~5 sequential round trips instead of one.
+        $top: count,
         $orderby: 'start/dateTime',
         $select: 'id,subject,bodyPreview,start,end,location,attendees,type',
       },
@@ -450,7 +453,8 @@ const deleteEvent = defineTool({
     'cancels the original for every attendee and loses their responses. Recurring events ' +
     'REQUIRE scope. Not reversible.',
   scopes: [WRITE],
-  annotations: { destructiveHint: true, idempotentHint: true },
+  // Not idempotent: a repeated delete 404s, because the event no longer exists.
+  annotations: { destructiveHint: true },
   input: {
     eventId: z.string(),
     scope: SCOPE_ARG.optional(),
@@ -546,7 +550,12 @@ function respondTool(name: 'accept' | 'decline' | 'tentativelyAccept', label: st
       });
       return { id: args.eventId, response: label };
     },
-    render: (data) => `Invitation ${data.response}d. The organiser has been notified.`,
+    // The structured `response` stays the label verbatim; only the prose needs
+    // the past tense, and "accept"/"decline" do not inflect the same way.
+    render: (data) => {
+      const past: Record<string, string> = { accept: 'accepted', decline: 'declined' };
+      return `Invitation ${past[data.response] ?? data.response}. The organiser has been notified.`;
+    },
   });
 }
 

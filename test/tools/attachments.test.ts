@@ -342,6 +342,79 @@ describe('add-attachment', () => {
     expect(text).toContain('invoice.pdf');
   });
 
+  /** "fails without leaving a half-filled draft behind" — the copy path too. */
+  test('a bad copy reference fails before any local file is uploaded', async () => {
+    const local = join(dir, 'notes.txt');
+    await writeFile(local, 'hello');
+
+    const { text, of } = await call(
+      'add-attachment',
+      { messageId: 'draft1', filePath: [local], fromMessageId: 'msg1', fromAttachment: 'ghost.pdf' },
+      draftOn('draft1'),
+      attachmentsOn('draft1', []),
+      attachmentsOn('msg1', [PDF]),
+    );
+
+    expect(text).toContain('No attachment matching "ghost.pdf"');
+    expect(of('POST')).toHaveLength(0);
+    expect(of('UPLOAD')).toHaveLength(0);
+    expect(of('BYTES')).toHaveLength(0);
+  });
+
+  test('an oversized copy source is refused before anything is fetched or uploaded', async () => {
+    const { text, of } = await call(
+      'add-attachment',
+      { messageId: 'draft1', fromMessageId: 'msg1', fromAttachment: 'huge.bin' },
+      draftOn('draft1'),
+      attachmentsOn('draft1', []),
+      attachmentsOn('msg1', [
+        { ...PDF, id: 'att-huge', name: 'huge.bin', size: MAX_TOTAL_ATTACHMENT_BYTES },
+      ]),
+      on('BYTES', '$value', Buffer.from('NEVER-FETCHED')),
+    );
+
+    expect(text).toContain('over the 25.0 MB');
+    expect(of('BYTES')).toHaveLength(0);
+    expect(of('POST')).toHaveLength(0);
+  });
+
+  test('a copied attachment counts against what the draft already holds', async () => {
+    // 15 MB copied onto a draft holding 10 MB: each fits alone, together they
+    // encode past the ceiling.
+    const { text, of } = await call(
+      'add-attachment',
+      { messageId: 'draft1', fromMessageId: 'msg1', fromAttachment: 'big.pdf' },
+      draftOn('draft1'),
+      attachmentsOn('draft1', [{ ...PDF, size: 10 * 1024 * 1024 }]),
+      attachmentsOn('msg1', [{ ...PDF, id: 'att-big', name: 'big.pdf', size: 15 * 1024 * 1024 }]),
+      on('BYTES', '$value', Buffer.from('NEVER-FETCHED')),
+    );
+
+    expect(text).toContain('already attached');
+    expect(of('BYTES')).toHaveLength(0);
+    expect(of('POST')).toHaveLength(0);
+  });
+
+  test('the copy source counts alongside local files', async () => {
+    // 10 MB local + 12 MB copy source: each fits alone, together they do not.
+    const local = join(dir, 'ten.bin');
+    await writeFile(local, Buffer.alloc(10 * 1024 * 1024));
+
+    const { text, of } = await call(
+      'add-attachment',
+      { messageId: 'draft1', filePath: [local], fromMessageId: 'msg1', fromAttachment: 'big.pdf' },
+      draftOn('draft1'),
+      attachmentsOn('draft1', []),
+      attachmentsOn('msg1', [{ ...PDF, id: 'att-big', name: 'big.pdf', size: 12 * 1024 * 1024 }]),
+      on('BYTES', '$value', Buffer.from('NEVER-FETCHED')),
+    );
+
+    expect(text).toContain('over the 25.0 MB');
+    expect(of('POST')).toHaveLength(0);
+    expect(of('UPLOAD')).toHaveLength(0);
+    expect(of('BYTES')).toHaveLength(0);
+  });
+
   test('renames a copied attachment when asked', async () => {
     const { of } = await call(
       'add-attachment',

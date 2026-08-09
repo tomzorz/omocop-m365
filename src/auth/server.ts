@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 /**
  * The local sign-in server.
  *
@@ -126,13 +127,14 @@ export class AuthServer {
   private async exchange(code: string, verifier: string): Promise<StoredTokens> {
     const body = new URLSearchParams({
       client_id: this.config.clientId,
-      client_secret: this.config.clientSecret,
       code,
       redirect_uri: this.config.redirectUri,
       grant_type: 'authorization_code',
       code_verifier: verifier,
       scope: this.config.scopes.join(' '),
     });
+    // A public-client registration has no secret; PKCE alone carries the flow.
+    if (this.config.clientSecret) body.set('client_secret', this.config.clientSecret);
 
     const response = await this.fetchImpl(`${this.config.authority}/oauth2/v2.0/token`, {
       method: 'POST',
@@ -249,8 +251,10 @@ export class AuthServer {
       });
     });
 
+    // Loopback only: this server exchanges authorization codes for tokens, and
+    // nothing off this machine has any business reaching it.
     await new Promise<void>((resolve) => {
-      this.server?.listen(this.config.authPort, resolve);
+      this.server?.listen(this.config.authPort, '127.0.0.1', resolve);
     });
 
     this.logger.info(

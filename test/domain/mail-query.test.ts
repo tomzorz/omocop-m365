@@ -15,7 +15,27 @@ describe('filter queries', () => {
   test('build an OData filter from criteria', () => {
     const { params } = build({ from: 'alice@example.com', hasAttachments: true, unreadOnly: true });
     expect(params['$filter']).toBe(
-      "from/emailAddress/address eq 'alice@example.com' and hasAttachments eq true and isRead eq false",
+      'receivedDateTime ge 1900-01-01T00:00:00Z and ' +
+        "from/emailAddress/address eq 'alice@example.com' and hasAttachments eq true and " +
+        'isRead eq false',
+    );
+  });
+
+  /**
+   * Graph requires every `$orderby` property to appear in `$filter` before any
+   * other clause. Without a receivedDateTime clause, `isRead eq false` alone
+   * alongside the ordering is a 400 InefficientFilter from live Graph.
+   */
+  test('a filter without a date criterion still starts with receivedDateTime', () => {
+    const { params } = build({ unreadOnly: true });
+    expect(String(params['$filter'])).toMatch(/^receivedDateTime ge 1900-01-01T00:00:00Z and /);
+    expect(params['$orderby']).toBe('receivedDateTime desc');
+  });
+
+  test('date criteria come first, before clauses on other properties', () => {
+    const { params } = build({ since: '2026-08-01T00:00:00Z', unreadOnly: true });
+    expect(params['$filter']).toBe(
+      'receivedDateTime ge 2026-08-01T00:00:00Z and isRead eq false',
     );
   });
 
@@ -32,7 +52,11 @@ describe('filter queries', () => {
   });
 
   test('omit the filter entirely when nothing was asked for', () => {
-    expect(build({}).params['$filter']).toBeUndefined();
+    // Plain $orderby with no $filter is a combination Graph accepts; the
+    // always-true clause is only needed once a filter exists.
+    const { params } = build({});
+    expect(params['$filter']).toBeUndefined();
+    expect(params['$orderby']).toBe('receivedDateTime desc');
   });
 
   /** Filtering by recipient is not supported on the messages collection. */
@@ -70,21 +94,44 @@ describe('text search', () => {
     const search = String(params['$search']);
     expect(search).toContain('invoice');
     expect(search).toContain('from:alice@example.com');
-    expect(search).toContain('subject:"Q3 report"');
+    expect(search).toContain('subject:\\"Q3 report\\"');
     // KQL spells this singular, unlike the OData property.
     expect(search).toContain('hasattachment:true');
   });
 
-  test('quote KQL values containing spaces', () => {
-    expect(String(build({ query: 'x', subject: 'two words' }).params['$search']))
-      .toContain('subject:"two words"');
+  /**
+   * The KQL travels inside one double-quoted $search parameter, so the quotes
+   * KQL adds around a multi-word value must arrive backslash-escaped — bare,
+   * they would terminate the wrapper mid-way.
+   */
+  test('quote KQL values containing spaces, escaped for the $search wrapper', () => {
+    const search = String(build({ query: 'x', subject: 'two words' }).params['$search']);
+    expect(search).toContain('subject:\\"two words\\"');
+    expect(search).toMatch(/^"/);
+    expect(search).toMatch(/[^\\]"$/);
     expect(String(build({ query: 'x', subject: 'oneword' }).params['$search']))
       .toContain('subject:oneword');
+  });
+
+  test('a double quote in the free text does not break the wrapper', () => {
+    const search = String(build({ query: 'the "big" report' }).params['$search']);
+    expect(search).toBe('"the \\"big\\" report"');
   });
 
   test('convert date bounds to KQL received terms', () => {
     const search = String(build({ query: 'x', since: '2026-08-01T00:00:00Z' }).params['$search']);
     expect(search).toContain('received>=2026-08-01');
+  });
+
+  /** Nothing is silently dropped — a truncated time-of-day is reported. */
+  test('say so when truncating a date bound drops a time of day', () => {
+    const { notes } = build({ query: 'x', since: '2026-08-01T14:30:00Z' });
+    expect(notes.join()).toContain('time of day on `since` was dropped');
+  });
+
+  test('a date-only bound loses nothing, so no truncation note', () => {
+    const { notes } = build({ query: 'x', until: '2026-08-31' });
+    expect(notes.join()).not.toContain('dropped');
   });
 
   test('report that ordering is by relevance', () => {

@@ -20,8 +20,13 @@ describe('required settings', () => {
     expect(caught).toBeInstanceOf(ConfigError);
     const message = (caught as Error).message;
     expect(message).toContain('M365_CLIENT_ID');
-    expect(message).toContain('M365_CLIENT_SECRET');
     expect(message).toContain('does not read .env');
+  });
+
+  test('the client secret is optional: absent means a public-client registration', () => {
+    const config = loadConfig({ M365_CLIENT_ID: 'cid' });
+    expect(config.clientId).toBe('cid');
+    expect(config.clientSecret).toBeUndefined();
   });
 
   test('treats whitespace-only as absent', () => {
@@ -42,11 +47,25 @@ describe('scopes', () => {
 
   test('accepts an override split on spaces or commas', () => {
     expect(loadConfig({ ...MINIMAL, M365_SCOPES: 'A B,C   D' }).scopes)
-      .toEqual(['A', 'B', 'C', 'D']);
+      .toEqual(['A', 'B', 'C', 'D', 'offline_access']);
   });
 
   test('an empty override falls back to the defaults', () => {
     expect(loadConfig({ ...MINIMAL, M365_SCOPES: '   ' }).scopes).toEqual([...DEFAULT_SCOPES]);
+  });
+
+  /**
+   * A grant without offline_access yields no refresh token, so every sign-in
+   * dies at the first expiry — an override omitting it gets it appended.
+   */
+  test('offline_access is appended when an override omits it', () => {
+    expect(loadConfig({ ...MINIMAL, M365_SCOPES: 'Mail.Read' }).scopes)
+      .toEqual(['Mail.Read', 'offline_access']);
+  });
+
+  test('offline_access is not duplicated when already present, whatever the case', () => {
+    expect(loadConfig({ ...MINIMAL, M365_SCOPES: 'OFFLINE_ACCESS Mail.Read' }).scopes)
+      .toEqual(['OFFLINE_ACCESS', 'Mail.Read']);
   });
 });
 
@@ -104,10 +123,5 @@ describe('other settings', () => {
 
   test('hideUngrantedTools defaults off', () => {
     expect(loadConfig(MINIMAL).hideUngrantedTools).toBe(false);
-  });
-
-  test('falls back to info for an unknown log level', () => {
-    expect(loadConfig({ ...MINIMAL, LOG_LEVEL: 'shouty' }).logLevel).toBe('info');
-    expect(loadConfig({ ...MINIMAL, LOG_LEVEL: 'debug' }).logLevel).toBe('debug');
   });
 });

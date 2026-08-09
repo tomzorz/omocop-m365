@@ -229,16 +229,35 @@ const addAttachment = defineTool({
       );
     }
 
-    // Read and size-check everything before uploading any of it, so a bad path or
-    // an oversized set fails without leaving a half-filled draft behind.
+    // Read, resolve and size-check everything before uploading any of it, so a
+    // bad path, a bad copy reference, or an oversized set fails without leaving
+    // a half-filled draft behind.
     const files = await Promise.all(paths.map((path) => readLocalFile(path)));
 
+    let copySource: Attachment | undefined;
+    if (args.fromMessageId && args.fromAttachment) {
+      const source = await listAttachments(ctx.graph, args.fromMessageId);
+      const resolution = resolveAttachment(source, args.fromAttachment);
+      if (resolution.kind !== 'matched') throw new Error(resolution.message);
+      copySource = resolution.item;
+    }
+
+    // The copy source and the draft's existing attachments carry Graph's
+    // reported sizes, which may already include encoding overhead; weighing
+    // them as raw errs toward refusing here rather than dying at send time.
     const existing = await listAttachments(ctx.graph, args.messageId);
     const tooBig = checkTotalSize(
-      files,
+      copySource ? [...files, { name: copySource.name, size: copySource.size ?? 0 }] : files,
       existing.reduce((sum, a) => sum + (a.size ?? 0), 0),
     );
     if (tooBig) throw new Error(tooBig);
+
+    // Fetching the copied bytes before any upload keeps the promise above: a
+    // reference attachment or an over-limit download still fails cleanly.
+    const copyBuffer =
+      copySource && args.fromMessageId
+        ? await fetchAttachmentBytes(ctx.graph, args.fromMessageId, copySource)
+        : undefined;
 
     const attached: Array<{ name: string; size: number; chunked: boolean }> = [];
 
@@ -246,21 +265,12 @@ const addAttachment = defineTool({
       attached.push(await addFileAttachment(ctx.graph, args.messageId, file));
     }
 
-    if (args.fromMessageId && args.fromAttachment) {
-      const source = await listAttachments(ctx.graph, args.fromMessageId);
-      const resolution = resolveAttachment(source, args.fromAttachment);
-      if (resolution.kind !== 'matched') throw new Error(resolution.message);
-
-      const buffer = await fetchAttachmentBytes(
-        ctx.graph,
-        args.fromMessageId,
-        resolution.item,
-      );
+    if (copySource && copyBuffer) {
       attached.push(
         await addFileAttachment(ctx.graph, args.messageId, {
-          name: args.name ?? resolution.item.name,
-          buffer,
-          contentType: resolution.item.contentType ?? 'application/octet-stream',
+          name: args.name ?? copySource.name,
+          buffer: copyBuffer,
+          contentType: copySource.contentType ?? 'application/octet-stream',
         }),
       );
     }

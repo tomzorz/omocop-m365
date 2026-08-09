@@ -1,7 +1,7 @@
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { IncomingMessage, ServerResponse } from 'node:http';
+import type { IncomingMessage, Server as HttpServer, ServerResponse } from 'node:http';
 import { afterEach, beforeEach, describe, expect, test } from 'vitest';
 import { AuthServer, createPkcePair, escapeHtml, safeEquals } from '../../src/auth/server.js';
 import { TokenStore, type StoredTokens } from '../../src/auth/token-store.js';
@@ -36,8 +36,10 @@ const req = (url: string): IncomingMessage => ({ url }) as IncomingMessage;
 
 function tokenEndpoint(spec: { status?: number; body: unknown }) {
   let calls = 0;
+  const bodies: string[] = [];
   const impl = (async (_url: string, init: RequestInit) => {
     calls += 1;
+    bodies.push(String(init.body));
     const status = spec.status ?? 200;
     return {
       ok: status >= 200 && status < 300,
@@ -47,7 +49,7 @@ function tokenEndpoint(spec: { status?: number; body: unknown }) {
       __body: String(init.body),
     } as unknown as Response;
   }) as unknown as typeof fetch;
-  return { impl, calls: () => calls };
+  return { impl, calls: () => calls, bodies };
 }
 
 let dir: string;
@@ -152,6 +154,30 @@ describe('callback', () => {
     const stored = JSON.parse(await readFile(config.tokenStorePath, 'utf8')) as StoredTokens;
     expect(stored.refreshToken).toBe('rt');
     expect(stored.scopes).toEqual(['Mail.ReadWrite', 'Calendars.ReadWrite']);
+  });
+
+  test('sends client_secret when configured, omits it for a public client', async () => {
+    // Confidential client: the secret goes out.
+    const withSecret = tokenEndpoint({ body: goodBody });
+    const server = new AuthServer(config, silent, store, withSecret.impl);
+    const state = new URL(server.authorizeUrl()).searchParams.get('state');
+    await server.handle(req(`/auth/callback?code=abc&state=${state}`), fakeRes().res);
+    expect(withSecret.bodies[0]).toContain('client_secret=sec');
+
+    // Public client: no secret exists, and an empty one must not be sent —
+    // PKCE (the code_verifier) carries the flow alone.
+    const publicConfig = loadConfig({
+      M365_CLIENT_ID: 'cid',
+      M365_TOKEN_STORE: join(dir, 'tokens-public.json'),
+      M365_AUTH_PORT: '3999',
+    });
+    const publicStore = new TokenStore(publicConfig, silent, (async () => ({})) as unknown as typeof fetch);
+    const noSecret = tokenEndpoint({ body: goodBody });
+    const publicServer = new AuthServer(publicConfig, silent, publicStore, noSecret.impl);
+    const publicState = new URL(publicServer.authorizeUrl()).searchParams.get('state');
+    await publicServer.handle(req(`/auth/callback?code=abc&state=${publicState}`), fakeRes().res);
+    expect(noSecret.bodies[0]).not.toContain('client_secret');
+    expect(noSecret.bodies[0]).toContain('code_verifier=');
   });
 
   test('reports the signed-in account when the id token carries one', async () => {
@@ -268,5 +294,22 @@ describe('routing', () => {
     const { res, state: out } = fakeRes();
     await server.handle(req('/wat'), res);
     expect(out.status).toBe(404);
+  });
+});
+
+describe('listen', () => {
+  /**
+   * This server exchanges authorization codes for tokens; bound to all
+   * interfaces it would be reachable from the local network.
+   */
+  test('binds to the loopback interface only', async () => {
+    const server = new AuthServer(config, silent, store);
+    await server.listen();
+    try {
+      const address = (server as unknown as { server: HttpServer }).server.address();
+      expect(address).toMatchObject({ address: '127.0.0.1', port: 3999 });
+    } finally {
+      await server.close();
+    }
   });
 });

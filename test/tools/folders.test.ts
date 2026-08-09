@@ -166,13 +166,24 @@ describe('move-emails', () => {
     expect(text).toContain('changes its id');
   });
 
+  /** A bad destination is a policy refusal, like every other folder-taking tool. */
   test('refuses an unknown destination without moving anything', async () => {
-    const { of, text } = await call(
+    const { of, text, result } = await call(
       'move-emails',
       { messageIds: ['m1'], destinationFolder: 'Nowhere' },
       ...tree,
     );
+    expect(result.isError).toBe(true);
     expect(text).toContain('No folder matching');
     expect(of('POST')).toHaveLength(0);
+  });
+
+  test('refuses a blank destination before touching Graph', async () => {
+    const { text, calls } = await call('move-emails', {
+      messageIds: ['m1'],
+      destinationFolder: '   ',
+    });
+    expect(text).toContain('destinationFolder is required');
+    expect(calls).toHaveLength(0);
   });
 });

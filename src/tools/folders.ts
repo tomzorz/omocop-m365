@@ -5,7 +5,6 @@ import { z } from 'zod';
 import { defineTool } from '../server/tool.js';
 import type { AnyToolDefinition } from '../server/registry.js';
 import { gpath } from '../graph/path.js';
-import { resolveFolder, wellKnownFolder } from '../domain/folders.js';
 import {
   FOLDER_ARG,
   fetchFlatFolders,
@@ -96,24 +95,12 @@ const moveEmails = defineTool({
     failed: z.array(z.object({ id: z.string(), reason: z.string() })),
     destination: z.string(),
   },
+  policies: [requireFolder('destinationFolder', { required: true })],
   handler: async (args, ctx) => {
-    // Resolved inline rather than by policy, because the argument name differs
-    // and the destination is required here.
-    const reference = args.destinationFolder.trim();
-    const wellKnown = wellKnownFolder(reference);
-
-    let destinationId: string;
-    let destinationPath: string;
-
-    if (wellKnown) {
-      destinationId = wellKnown;
-      destinationPath = reference;
-    } else {
-      const resolution = resolveFolder(await fetchFlatFolders(ctx.graph), reference);
-      if (resolution.kind !== 'matched') throw new Error(resolution.message);
-      destinationId = resolution.item.id;
-      destinationPath = resolution.item.path;
-    }
+    const destination = resolvedFolder(ctx);
+    // requireFolder({ required: true }) refuses before the handler runs, so a
+    // null here means the policy list was edited out from under this tool.
+    if (!destination) throw new Error('requireFolder did not resolve a destination');
 
     const moved: Array<{ id: string; newId: string }> = [];
     const failed: Array<{ id: string; reason: string }> = [];
@@ -123,7 +110,7 @@ const moveEmails = defineTool({
     for (const id of args.messageIds) {
       try {
         const result = await ctx.graph.post<{ id: string }>(`${messagePath(id)}/move`, {
-          destinationId,
+          destinationId: destination.id,
         });
         moved.push({ id, newId: result.id });
       } catch (error) {
@@ -131,7 +118,7 @@ const moveEmails = defineTool({
       }
     }
 
-    return { moved, failed, destination: destinationPath };
+    return { moved, failed, destination: destination.path };
   },
   render: (data) =>
     `Moved ${data.moved.length} message(s) to ${data.destination}.` +

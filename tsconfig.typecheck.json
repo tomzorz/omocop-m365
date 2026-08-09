@@ -1,0 +1,13 @@
+{
+  // Widens the compiler's view to the tests and vitest config, which the build
+  // config must exclude (only src/ may emit into dist/). `npm run typecheck`
+  // uses this; `npm run build` stays on tsconfig.json — vitest runs tests
+  // without typechecking them, so this is the only gate they pass through.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": "."
+  },
+  "include": ["src/**/*.ts", "test/**/*.ts", "vitest.config.ts"],
+  "exclude": ["node_modules", "dist"]
+}

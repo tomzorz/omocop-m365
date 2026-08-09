@@ -50,7 +50,7 @@ function kqlValue(value: string): string {
   return /\s/.test(trimmed) ? `"${trimmed}"` : trimmed;
 }
 
-function buildKql(criteria: SearchCriteria): string {
+function buildKql(criteria: SearchCriteria, notes: string[]): string {
   const terms: string[] = [];
 
   if (criteria.query?.trim()) terms.push(criteria.query.trim());
@@ -59,14 +59,39 @@ function buildKql(criteria: SearchCriteria): string {
   if (criteria.subject?.trim()) terms.push(`subject:${kqlValue(criteria.subject)}`);
   // KQL spells this singular, unlike the OData property.
   if (criteria.hasAttachments) terms.push('hasattachment:true');
-  if (criteria.since) terms.push(`received>=${criteria.since.slice(0, 10)}`);
-  if (criteria.until) terms.push(`received<=${criteria.until.slice(0, 10)}`);
+  // KQL received terms compare whole days, so a time-of-day bound cannot be
+  // honoured in a text search; when one was given, say what was dropped.
+  if (criteria.since) {
+    terms.push(`received>=${criteria.since.slice(0, 10)}`);
+    if (criteria.since.includes('T')) {
+      notes.push(
+        'The time of day on `since` was dropped: a text search compares received dates by ' +
+          'whole days.',
+      );
+    }
+  }
+  if (criteria.until) {
+    terms.push(`received<=${criteria.until.slice(0, 10)}`);
+    if (criteria.until.includes('T')) {
+      notes.push(
+        'The time of day on `until` was dropped: a text search compares received dates by ' +
+          'whole days.',
+      );
+    }
+  }
 
   return terms.join(' ');
 }
 
 function buildFilter(criteria: SearchCriteria): string[] {
   const clauses: string[] = [];
+
+  // Graph requires every property in `$orderby` to also appear in `$filter`,
+  // and to appear before any clause on another property — otherwise the request
+  // fails with 400 InefficientFilter. The query always orders by
+  // receivedDateTime, so its clauses go first.
+  if (criteria.since) clauses.push(`receivedDateTime ge ${criteria.since}`);
+  if (criteria.until) clauses.push(`receivedDateTime le ${criteria.until}`);
 
   if (criteria.from?.trim()) {
     clauses.push(`from/emailAddress/address eq ${odataString(criteria.from.trim())}`);
@@ -76,8 +101,6 @@ function buildFilter(criteria: SearchCriteria): string[] {
   }
   if (criteria.hasAttachments) clauses.push('hasAttachments eq true');
   if (criteria.unreadOnly) clauses.push('isRead eq false');
-  if (criteria.since) clauses.push(`receivedDateTime ge ${criteria.since}`);
-  if (criteria.until) clauses.push(`receivedDateTime le ${criteria.until}`);
 
   return clauses;
 }
@@ -97,7 +120,10 @@ export function buildMailQuery(criteria: SearchCriteria, count: number): BuiltQu
   const usesSearch = Boolean(criteria.query?.trim());
 
   if (usesSearch) {
-    params['$search'] = `"${buildKql(criteria)}"`;
+    // The KQL is passed as one double-quoted parameter, so any double quote the
+    // KQL itself carries (quoted multi-word values, quotes in the free text)
+    // must be escaped or it terminates the wrapper early.
+    params['$search'] = `"${buildKql(criteria, notes).replace(/"/g, '\\"')}"`;
 
     // Graph rejects $orderby alongside $search outright, and ignores $filter.
     // Saying so beats returning relevance-ordered results that look like the
@@ -118,7 +144,18 @@ export function buildMailQuery(criteria: SearchCriteria, count: number): BuiltQu
   }
 
   const clauses = buildFilter(criteria);
-  if (clauses.length > 0) params['$filter'] = clauses.join(' and ');
+
+  // Graph's rule for /messages: every property in `$orderby` must also appear
+  // in `$filter`, before any clause on another property. A filter without a
+  // receivedDateTime clause alongside this ordering is a 400 InefficientFilter,
+  // so one that is always true is prepended. No clauses at all is fine — plain
+  // `$orderby` needs no `$filter`.
+  if (clauses.length > 0) {
+    if (!clauses.some((clause) => clause.includes('receivedDateTime'))) {
+      clauses.unshift('receivedDateTime ge 1900-01-01T00:00:00Z');
+    }
+    params['$filter'] = clauses.join(' and ');
+  }
 
   // Ordering by the same property the filter ranges over is the combination Graph
   // reliably accepts.

@@ -149,7 +149,9 @@ export function requireEventTarget(
       if (resolution.kind !== 'matched') return { refuse: resolution.message };
       calendar = resolution.item;
 
-      if (calendar.canEdit === false && action !== 'update') {
+      // Every action reaching this policy mutates the event, so a read-only
+      // calendar refuses them all — before the event itself is even fetched.
+      if (calendar.canEdit === false) {
         return {
           refuse: `Calendar "${calendar.name}" is read-only, so its events cannot be changed.`,
         };

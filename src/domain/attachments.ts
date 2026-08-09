@@ -21,8 +21,16 @@ export const SIMPLE_ATTACH_LIMIT = 3 * 1024 * 1024;
 /** Upload session chunks must be a multiple of 320 KiB. */
 export const UPLOAD_CHUNK_SIZE = 5 * 320 * 1024;
 
-/** What Exchange will carry on one message, once encoding is counted. */
+/**
+ * What Exchange will carry on one message. The wire cost is what counts:
+ * attachments travel base64-encoded, so comparisons against this ceiling use
+ * `encodedTransportSize`, not raw bytes — 25 MB of raw attachments encodes to
+ * ~33 MB and dies at send time.
+ */
 export const MAX_TOTAL_ATTACHMENT_BYTES = 25 * 1024 * 1024;
+
+/** What raw bytes cost once base64-encoded for transport: ceil(bytes * 4 / 3). */
+export const encodedTransportSize = (bytes: number): number => Math.ceil((bytes * 4) / 3);
 
 /** Refuse to hold anything absurd in memory in one piece. */
 export const MAX_DOWNLOAD_BYTES = 150 * 1024 * 1024;
@@ -60,6 +68,8 @@ export const needsUploadSession = (size: number): boolean => size > SIMPLE_ATTAC
 
 /** Byte ranges for an upload session, in order. */
 export function chunkRanges(total: number, chunkSize = UPLOAD_CHUNK_SIZE): Array<{ start: number; end: number }> {
+  // A non-positive chunk size would make the loop below spin forever.
+  if (chunkSize <= 0) throw new Error(`Chunk size must be positive, got ${chunkSize}.`);
   const ranges: Array<{ start: number; end: number }> = [];
   for (let start = 0; start < total; start += chunkSize) {
     ranges.push({ start, end: Math.min(start + chunkSize, total) });
@@ -75,23 +85,29 @@ export interface SizedFile {
 /**
  * Checks a set of attachments against the message ceiling.
  *
- * @param alreadyAttached bytes already on the message
+ * Every size is weighed as encoded-for-transport (`encodedTransportSize`),
+ * because that is what Exchange weighs at send time — summing raw bytes would
+ * pass sets that still die on send. The refusal prose shows the encoded
+ * figures, so the numbers a caller sees add up.
+ *
+ * @param alreadyAttached raw bytes already on the message
  * @returns a refusal message, or undefined when it fits
  */
 export function checkTotalSize(
   files: readonly SizedFile[],
   alreadyAttached = 0,
 ): string | undefined {
-  const incoming = files.reduce((sum, file) => sum + file.size, 0);
-  const total = incoming + alreadyAttached;
+  const incoming = files.reduce((sum, file) => sum + encodedTransportSize(file.size), 0);
+  const existing = encodedTransportSize(alreadyAttached);
+  const total = incoming + existing;
   if (total <= MAX_TOTAL_ATTACHMENT_BYTES) return undefined;
 
   const context = alreadyAttached
-    ? ` (${formatSize(alreadyAttached)} already attached, ${formatSize(incoming)} being added)`
+    ? ` (${formatSize(existing)} already attached, ${formatSize(incoming)} being added)`
     : '';
 
   return (
-    `Attachments total ${formatSize(total)}${context}, over the ` +
+    `Attachments total ${formatSize(total)} once encoded for transport${context}, over the ` +
     `${formatSize(MAX_TOTAL_ATTACHMENT_BYTES)} a message can carry. Send fewer files, or ` +
     `share a link instead.`
   );
@@ -156,13 +172,22 @@ export function chooseTargetPath(
 }
 
 /**
- * Strips path separators from a sender-supplied filename.
+ * Makes a sender-supplied filename safe to write on this host.
  *
  * An attachment name arrives from whoever sent the message. Joining it to a
- * directory unexamined lets `../../` walk out of the destination.
+ * directory unexamined lets `../../` walk out of the destination; and this
+ * server runs on Windows, where `NUL.txt` names a device and a trailing dot
+ * or space is silently dropped, landing the file under a different name than
+ * the one reported.
  */
 export function sanitiseFilename(name: string): string {
   const flattened = basename(name.replace(/\\/g, '/'));
-  const cleaned = flattened.replace(/[<>:"|?*]/g, '_').trim();
-  return cleaned === '' || cleaned === '.' || cleaned === '..' ? 'attachment' : cleaned;
+  const cleaned = flattened
+    .replace(/[<>:"|?*]/g, '_')
+    .trim()
+    .replace(/[. ]+$/, '');
+  if (cleaned === '' || cleaned === '.' || cleaned === '..') return 'attachment';
+  // CON, PRN, AUX, NUL, COM1–COM9 and LPT1–LPT9 name devices on Windows — in
+  // any case, and even with an extension — and cannot be created as files.
+  return /^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)/i.test(cleaned) ? `_${cleaned}` : cleaned;
 }

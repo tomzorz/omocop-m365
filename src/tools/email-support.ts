@@ -139,14 +139,35 @@ export interface Recipient {
   readonly emailAddress: { readonly address: string; readonly name?: string };
 }
 
-/** Splits a comma or semicolon separated address list. */
+/**
+ * Splits a comma or semicolon separated address list.
+ *
+ * An entry may be a bare address or the display-name form `Name <address>` —
+ * passing the latter through as a literal address makes Graph reject the send.
+ * A separator inside a double-quoted name (`"Smith, Bob" <bob@x.com>`) does not
+ * split the entry; an unbalanced quote falls back to splitting everywhere.
+ */
 export function toRecipients(value: string | readonly string[] | undefined): Recipient[] {
   if (!value) return [];
-  const parts = Array.isArray(value) ? value : String(value).split(/[,;]/);
+  // Split only where an even number of double quotes remains ahead, so a
+  // separator inside a quoted display name stays part of its entry.
+  const parts = Array.isArray(value)
+    ? value
+    : String(value).split(/[,;](?=(?:[^"]*"[^"]*")*[^"]*$)/);
   return parts
     .map((entry) => String(entry).trim())
     .filter(Boolean)
-    .map((address) => ({ emailAddress: { address } }));
+    .map(parseRecipient);
+}
+
+/** `Name <address>` becomes address plus display name; anything else is taken as the address. */
+function parseRecipient(entry: string): Recipient {
+  const match = /^(.*)<([^<>]+)>$/.exec(entry);
+  if (!match) return { emailAddress: { address: entry } };
+
+  const address = (match[2] ?? '').trim();
+  const name = (match[1] ?? '').trim().replace(/^"(.*)"$/s, '$1').trim();
+  return { emailAddress: { address, ...(name ? { name } : {}) } };
 }
 
 /** Addresses from a Graph recipient list, for display. */

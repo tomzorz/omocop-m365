@@ -1,5 +1,10 @@
-import { describe, expect, test } from 'vitest';
-import { createLogger, installStdoutGuard, redact } from '../src/logging.js';
+import { afterEach, beforeEach, describe, expect, test } from 'vitest';
+import {
+  STDOUT_CONSOLE_METHODS,
+  createLogger,
+  installStdoutGuard,
+  redact,
+} from '../src/logging.js';
 
 /** Collects log output instead of writing it anywhere. */
 function capture() {
@@ -63,8 +68,34 @@ describe('createLogger', () => {
     expect(lines[0]).toContain('boom');
   });
 
-  test('defaults to info when LOG_LEVEL is absent or nonsense', () => {
+});
+
+describe('LOG_LEVEL default', () => {
+  // The default level comes from the ambient environment, so it is pinned and
+  // restored explicitly — otherwise this suite would pass or fail depending on
+  // what the host machine happens to export.
+  let saved: string | undefined;
+  beforeEach(() => {
+    saved = process.env['LOG_LEVEL'];
+  });
+  afterEach(() => {
+    if (saved === undefined) delete process.env['LOG_LEVEL'];
+    else process.env['LOG_LEVEL'] = saved;
+  });
+
+  test('defaults to info when LOG_LEVEL is absent', () => {
+    delete process.env['LOG_LEVEL'];
     expect(createLogger(undefined as never, () => {}).level).toBe('info');
+  });
+
+  test('falls back to info when LOG_LEVEL is nonsense', () => {
+    process.env['LOG_LEVEL'] = 'shouty';
+    expect(createLogger(undefined as never, () => {}).level).toBe('info');
+  });
+
+  test('honours a valid LOG_LEVEL, however cased', () => {
+    process.env['LOG_LEVEL'] = ' DEBUG ';
+    expect(createLogger(undefined as never, () => {}).level).toBe('debug');
   });
 });
 
@@ -85,13 +116,36 @@ describe('installStdoutGuard', () => {
     expect(console.log).toBe(original);
   });
 
-  test('covers every console method that writes to stdout', () => {
-    const { sink } = capture();
-    const restore = installStdoutGuard(createLogger('debug', sink));
-    for (const method of ['log', 'info', 'debug', 'dir', 'table', 'trace'] as const) {
-      expect(typeof console[method]).toBe('function');
+  test('every listed method reaches stderr and never stdout once guarded', () => {
+    const stdoutWrites: string[] = [];
+    const stderrWrites: string[] = [];
+    const originalStdoutWrite = process.stdout.write;
+    const originalStderrWrite = process.stderr.write;
+    process.stdout.write = ((chunk: string | Uint8Array) => {
+      stdoutWrites.push(String(chunk));
+      return true;
+    }) as typeof process.stdout.write;
+    process.stderr.write = ((chunk: string | Uint8Array) => {
+      stderrWrites.push(String(chunk));
+      return true;
+    }) as typeof process.stderr.write;
+
+    // The logger is built with the default sink so the probe exercises the real
+    // path to stderr, not an injected capture.
+    const restore = installStdoutGuard(createLogger('debug'));
+    try {
+      for (const method of STDOUT_CONSOLE_METHODS) {
+        stdoutWrites.length = 0;
+        stderrWrites.length = 0;
+        (console[method] as (...args: unknown[]) => void)(`probe via ${method}`);
+        expect(stdoutWrites, `console.${method} leaked to stdout`).toEqual([]);
+        expect(stderrWrites.join(''), `console.${method} produced no stderr`).toContain(method);
+      }
+    } finally {
+      restore();
+      process.stdout.write = originalStdoutWrite;
+      process.stderr.write = originalStderrWrite;
     }
-    restore();
   });
 
   test('leaves console.error alone — stderr is already correct', () => {

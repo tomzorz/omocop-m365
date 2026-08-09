@@ -46,6 +46,17 @@ describe('offset-bearing timestamps', () => {
     expect(value('2026-08-15T16:00:00+0200').dateTime).toBe('2026-08-15T14:00:00');
   });
 
+  /**
+   * ISO allows an hour-only offset. Missing it would send the value out as
+   * naive-with-embedded-offset plus a named zone — the exact contradictory
+   * pairing this module exists to prevent.
+   */
+  test('an hour-only offset is recognised as an offset', () => {
+    expect(value('2026-08-15T16:00:00+02'))
+      .toEqual({ dateTime: '2026-08-15T14:00:00', timeZone: 'UTC' });
+    expect(value('2026-08-15T09:00-05').dateTime).toBe('2026-08-15T14:00:00');
+  });
+
   test('an offset wins over a contradicting named zone', () => {
     expect(value({ dateTime: '2026-08-15T14:00:00Z', timeZone: 'Pacific Standard Time' }))
       .toEqual({ dateTime: '2026-08-15T14:00:00', timeZone: 'UTC' });
@@ -70,6 +81,22 @@ describe('rejections', () => {
 
   test('an unparseable offset timestamp is refused', () => {
     expect(toGraphDateTime('2026-13-45T99:00:00Z', ZONE).ok).toBe(false);
+  });
+
+  /**
+   * The shape check is anchored: a value with trailing text would otherwise go
+   * to Graph as a literal dateTime and come back as an opaque 400.
+   */
+  test('trailing text after a valid timestamp is refused here, not sent on', () => {
+    const result = toGraphDateTime('2026-08-15T14:00 lunch with Bob', ZONE, 'start time');
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.message).toContain('start time');
+  });
+
+  test('a naive timestamp with impossible components is refused', () => {
+    expect(toGraphDateTime('2026-13-45T99:00', ZONE).ok).toBe(false);
+    expect(toGraphDateTime('2026-02-30T10:00:00', ZONE).ok).toBe(false);
   });
 
   test('undefined is refused with a required message', () => {

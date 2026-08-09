@@ -137,10 +137,30 @@ export function resolveScope(
     };
   }
 
-  const targetId =
-    scope === 'series' ? (event.seriesMasterId ?? event.id) : event.id;
+  if (scope === 'this') return { kind: 'resolved', targetId: event.id, scope };
 
-  return { kind: 'resolved', targetId, scope };
+  // scope === 'series'. A master's own id names the series; an occurrence's id
+  // names one date, so it may only stand in for the series when the master's id
+  // is actually known — otherwise the action would touch one occurrence while
+  // being reported as covering the whole series.
+  if (event.type === 'seriesMaster') {
+    return { kind: 'resolved', targetId: event.id, scope };
+  }
+
+  if (!event.seriesMasterId) {
+    return {
+      kind: 'refused',
+      message:
+        `"${subject}" is one occurrence${occurrenceDate(event)} of a recurring series, but ` +
+        `the data returned for it has no seriesMasterId, so no id that names the whole ` +
+        `series is available. Acting on this id would touch only this occurrence while ` +
+        `claiming the ${wording.noun} ${wording.onSeries}. Re-fetch the event with its ` +
+        `seriesMasterId included (or take the master's id from a listing) and call again, ` +
+        `or pass scope:"this", which ${wording.onThis}.`,
+    };
+  }
+
+  return { kind: 'resolved', targetId: event.seriesMasterId, scope };
 }
 
 /** Suffix describing what a completed action covered. */

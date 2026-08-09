@@ -86,6 +86,18 @@ function buildService(images: EmailImage[]): TurndownService {
   return service;
 }
 
+/**
+ * Reduces HTML to visible text with no markup at all: script, style, head and
+ * noscript blocks go entirely — their text included, since it is code, not
+ * content — and every remaining tag is dropped. A block left unterminated is
+ * removed to the end of the input rather than allowing its body through.
+ */
+function stripToText(html: string): string {
+  return html
+    .replace(/<(script|style|head|noscript)\b[^>]*>[\s\S]*?(?:<\/\1\s*>|$)/gi, ' ')
+    .replace(/<[^>]*>/g, ' ');
+}
+
 /** Collapses runs of blank lines, which layout tables produce in quantity. */
 function tidy(markdown: string): string {
   return markdown
@@ -98,8 +110,9 @@ function tidy(markdown: string): string {
 /**
  * Converts an HTML email body to Markdown.
  *
- * Never throws: a body that cannot be parsed at all comes back as its own text,
- * because failing to read one message must not fail the tool that read it.
+ * Never throws: a body the converter cannot handle comes back as tag-stripped
+ * plain text, because failing to read one message must not fail the tool that
+ * read it — and the fallback keeps the no-script, no-style guarantee.
  */
 export function htmlToMarkdown(html: string): ConvertedBody {
   if (!html || !html.trim()) return { markdown: '', images: [] };
@@ -108,8 +121,9 @@ export function htmlToMarkdown(html: string): ConvertedBody {
   try {
     return { markdown: tidy(buildService(images).turndown(html)), images };
   } catch {
-    // Fall back to the raw body rather than losing the message entirely.
-    return { markdown: tidy(html), images };
+    // Degraded plain text beats losing the message — but even when conversion
+    // fails, script and style content is never emitted, and no tag is either.
+    return { markdown: tidy(stripToText(html)), images };
   }
 }
 

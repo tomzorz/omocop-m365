@@ -7,6 +7,7 @@ import {
   chunkRanges,
   classifyAttachment,
   contentTypeFor,
+  encodedTransportSize,
   formatSize,
   isImageType,
   MAX_DOWNLOAD_BYTES,
@@ -76,32 +77,53 @@ describe('upload routing', () => {
   test('an empty file produces no ranges', () => {
     expect(chunkRanges(0)).toEqual([]);
   });
+
+  test('refuses a non-positive chunk size rather than looping forever', () => {
+    expect(() => chunkRanges(100, 0)).toThrow(/positive/);
+    expect(() => chunkRanges(100, -320 * 1024)).toThrow(/positive/);
+  });
+});
+
+describe('encodedTransportSize', () => {
+  test('is the base64 estimate, rounded up', () => {
+    expect(encodedTransportSize(0)).toBe(0);
+    expect(encodedTransportSize(1)).toBe(2);
+    expect(encodedTransportSize(3)).toBe(4);
+    expect(encodedTransportSize(3 * 1024 * 1024)).toBe(4 * 1024 * 1024);
+  });
 });
 
 describe('total size ceiling', () => {
   const file = (size: number) => ({ name: 'f.bin', size });
+  /** The largest raw payload whose encoded form still fits: MAX * 3/4 exactly. */
+  const rawCapacity = (MAX_TOTAL_ATTACHMENT_BYTES / 4) * 3;
 
-  test('accepts a set under the ceiling', () => {
+  test('accepts a set whose encoded size is under the ceiling', () => {
     expect(checkTotalSize([file(1024)])).toBeUndefined();
-    expect(checkTotalSize([file(MAX_TOTAL_ATTACHMENT_BYTES)])).toBeUndefined();
+    expect(checkTotalSize([file(rawCapacity)])).toBeUndefined();
   });
 
-  test('rejects a set over it, with sizes named', () => {
-    const message = checkTotalSize([file(MAX_TOTAL_ATTACHMENT_BYTES + 1)]);
+  test('weighs encoded size, not raw: 25 MB raw would die at send time', () => {
+    expect(checkTotalSize([file(MAX_TOTAL_ATTACHMENT_BYTES)])).toBeDefined();
+    expect(checkTotalSize([file(rawCapacity + 1)])).toBeDefined();
+  });
+
+  test('rejects a set over it, saying the size is measured as encoded', () => {
+    const message = checkTotalSize([file(MAX_TOTAL_ATTACHMENT_BYTES)]);
     expect(message).toContain('over the 25.0 MB');
+    expect(message).toContain('encoded for transport');
   });
 
-  test('counts what is already attached', () => {
-    const half = Math.floor(MAX_TOTAL_ATTACHMENT_BYTES / 2);
-    expect(checkTotalSize([file(half)])).toBeUndefined();
-
-    const message = checkTotalSize([file(half)], half + 4096);
-    expect(message).toContain('already attached');
-    expect(message).toContain('being added');
+  test('counts what is already attached, with encoded figures that add up', () => {
+    const message = checkTotalSize([file(15 * 1024 * 1024)], 6 * 1024 * 1024);
+    // encoded: 15 MB -> 20 MB incoming, 6 MB -> 8 MB existing, 28 MB total.
+    expect(message).toContain('28.0 MB');
+    expect(message).toContain('8.0 MB already attached');
+    expect(message).toContain('20.0 MB being added');
   });
 
   test('sums several files', () => {
-    const third = Math.ceil(MAX_TOTAL_ATTACHMENT_BYTES / 3) + 1;
+    const third = Math.ceil(rawCapacity / 3) + 1;
     expect(checkTotalSize([file(third), file(third), file(third)])).toBeDefined();
   });
 });
@@ -160,6 +182,28 @@ describe('sanitiseFilename', () => {
     expect(sanitiseFilename('..')).toBe('attachment');
     expect(sanitiseFilename('/')).toBe('attachment');
     expect(sanitiseFilename('   ')).toBe('attachment');
+  });
+
+  /** Windows reserves these as device names, extension or not, any case. */
+  test('neutralises Windows reserved device names', () => {
+    expect(sanitiseFilename('NUL')).toBe('_NUL');
+    expect(sanitiseFilename('nul.txt')).toBe('_nul.txt');
+    expect(sanitiseFilename('Con.tar.gz')).toBe('_Con.tar.gz');
+    expect(sanitiseFilename('COM1')).toBe('_COM1');
+    expect(sanitiseFilename('lpt9.log')).toBe('_lpt9.log');
+    expect(sanitiseFilename('AUX')).toBe('_AUX');
+  });
+
+  test('leaves names that merely start with a device name alone', () => {
+    expect(sanitiseFilename('CONSOLE.txt')).toBe('CONSOLE.txt');
+    expect(sanitiseFilename('COM10.txt')).toBe('COM10.txt');
+    expect(sanitiseFilename('nullable.ts')).toBe('nullable.ts');
+  });
+
+  test('trims trailing dots and spaces, which Windows drops silently', () => {
+    expect(sanitiseFilename('report.pdf. . .')).toBe('report.pdf');
+    expect(sanitiseFilename('notes.txt   ')).toBe('notes.txt');
+    expect(sanitiseFilename('...')).toBe('attachment');
   });
 });
 

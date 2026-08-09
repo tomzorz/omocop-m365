@@ -14,8 +14,15 @@
  *
  * **Nothing here logs token material.** The logger redacts as a backstop, but the
  * rule is that this module does not pass tokens to it in the first place.
+ *
+ * **The token file is shared with other processes.** `npm run auth` and any
+ * second server instance write the same file, and Entra invalidates the old
+ * refresh token when it rotates one. So: a refresh re-reads disk before
+ * exchanging, an invalid_grant is retried once with whatever token is on disk,
+ * writes are write-then-rename so a crash cannot truncate the store, and
+ * "not authenticated" is never memoised past the failure that discovered it.
  */
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import type { Config } from '../config.js';
 import type { Logger } from '../logging.js';
@@ -93,8 +100,24 @@ export class TokenStore implements TokenProvider {
   ) {}
 
   private load(): Promise<StoredTokens | undefined> {
-    this.loadPromise ??= this.readFromDisk();
+    this.loadPromise ??= this.readFromDisk().then((tokens) => {
+      // "Not authenticated" is never memoised: signing in happens in another
+      // process (`npm run auth`), so the next call must re-read the file rather
+      // than repeat a stale verdict until this server restarts.
+      if (!tokens) this.loadPromise = undefined;
+      return tokens;
+    });
     return this.loadPromise;
+  }
+
+  /**
+   * Every give-up path funnels here. The error's own advice is "sign in, then
+   * retry", and signing in writes a new token file from another process — the
+   * retry can only see it if the memoised load is dropped.
+   */
+  private authRequired(detail?: string): AuthenticationRequiredError {
+    this.loadPromise = undefined;
+    return new AuthenticationRequiredError(detail);
   }
 
   /** A missing or corrupt file means "not authenticated", never an exception. */
@@ -122,11 +145,17 @@ export class TokenStore implements TokenProvider {
     // Replace the memoised read so later callers see the new value, not the old file.
     this.loadPromise = Promise.resolve(tokens);
     await mkdir(dirname(this.config.tokenStorePath), { recursive: true });
+    // Write-then-rename: a crash mid-write must leave the previous store intact,
+    // not a truncated file that silently reads as "not authenticated". The temp
+    // file sits in the same directory so the rename cannot cross filesystems;
+    // the pid keeps two processes from clobbering each other's temp file.
+    const tempPath = `${this.config.tokenStorePath}.${process.pid}.tmp`;
     // 0600: the refresh token is a long-lived credential.
-    await writeFile(this.config.tokenStorePath, JSON.stringify(tokens, null, 2), {
+    await writeFile(tempPath, JSON.stringify(tokens, null, 2), {
       encoding: 'utf8',
       mode: 0o600,
     });
+    await rename(tempPath, this.config.tokenStorePath);
     this.logger.debug(`Token store written (${tokens.scopes.length} scopes granted)`);
   }
 
@@ -148,7 +177,7 @@ export class TokenStore implements TokenProvider {
 
   async getAccessToken(): Promise<string> {
     const tokens = await this.load();
-    if (!tokens) throw new AuthenticationRequiredError();
+    if (!tokens) throw this.authRequired();
 
     if (tokens.expiresAt - this.now() > EXPIRY_SKEW_MS) return tokens.accessToken;
 
@@ -167,32 +196,48 @@ export class TokenStore implements TokenProvider {
     if (this.inFlight) return this.inFlight;
 
     const run = async (): Promise<StoredTokens> => {
-      const current = await this.load();
-      if (!current) throw new AuthenticationRequiredError();
+      let current = await this.load();
+      if (!current) throw this.authRequired();
 
-      const body = new URLSearchParams({
-        client_id: this.config.clientId,
-        client_secret: this.config.clientSecret,
-        refresh_token: current.refreshToken,
-        grant_type: 'refresh_token',
-        scope: this.config.scopes.join(' '),
-      });
+      // Another process sharing this file may have refreshed moments ago, and
+      // Entra invalidates the old refresh token on rotation — exchanging the
+      // in-memory one after a rotation elsewhere kills the stored credential.
+      // Disk is re-read inside the critical section so the rotated tokens win.
+      const onDisk = await this.readFromDisk();
+      if (
+        onDisk &&
+        (onDisk.accessToken !== current.accessToken ||
+          onDisk.refreshToken !== current.refreshToken)
+      ) {
+        current = onDisk;
+        this.loadPromise = Promise.resolve(onDisk);
+        if (onDisk.expiresAt - this.now() > EXPIRY_SKEW_MS) {
+          this.logger.debug('Adopted tokens refreshed by another process; skipping the exchange');
+          return onDisk;
+        }
+      }
 
-      const response = await this.fetchImpl(`${this.config.authority}/oauth2/v2.0/token`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: body.toString(),
-      });
+      let outcome = await this.exchange(current.refreshToken);
 
-      const payload = (await response.json().catch(() => ({}))) as TokenResponse;
+      if (!outcome.ok && outcome.payload.error === 'invalid_grant') {
+        // invalid_grant usually means spent or revoked — but when another
+        // process rotated the token between our disk read and the POST, the
+        // rotated token is on disk now and is worth exactly one retry before
+        // demanding a fresh sign-in.
+        const latest = await this.readFromDisk();
+        if (latest && latest.refreshToken !== current.refreshToken) {
+          current = latest;
+          this.loadPromise = Promise.resolve(latest);
+          outcome = await this.exchange(latest.refreshToken);
+        }
+      }
 
-      if (!response.ok || !payload.access_token) {
-        // invalid_grant means the refresh token is spent or revoked — no amount
-        // of retrying helps, the user has to sign in again.
+      const { payload } = outcome;
+      if (!outcome.ok || !payload.access_token) {
         const detail = payload.error
           ? `${payload.error}: ${payload.error_description ?? ''}`.trim()
-          : `HTTP ${response.status}`;
-        throw new AuthenticationRequiredError(`The refresh failed — ${detail}`);
+          : `HTTP ${outcome.status}`;
+        throw this.authRequired(`The refresh failed — ${detail}`);
       }
 
       const refreshed: StoredTokens = {
@@ -214,5 +259,28 @@ export class TokenStore implements TokenProvider {
     });
 
     return this.inFlight;
+  }
+
+  /** One refresh-token exchange; the caller owns the retry and give-up decisions. */
+  private async exchange(
+    refreshToken: string,
+  ): Promise<{ ok: boolean; status: number; payload: TokenResponse }> {
+    const body = new URLSearchParams({
+      client_id: this.config.clientId,
+      refresh_token: refreshToken,
+      grant_type: 'refresh_token',
+      scope: this.config.scopes.join(' '),
+    });
+    // A public-client registration has no secret; sending an empty one is an error.
+    if (this.config.clientSecret) body.set('client_secret', this.config.clientSecret);
+
+    const response = await this.fetchImpl(`${this.config.authority}/oauth2/v2.0/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: body.toString(),
+    });
+
+    const payload = (await response.json().catch(() => ({}))) as TokenResponse;
+    return { ok: response.ok && Boolean(payload.access_token), status: response.status, payload };
   }
 }

@@ -99,14 +99,24 @@ export function createLogger(
   };
 }
 
-/** Console methods that write to stdout, and so must never reach it. */
-const STDOUT_CONSOLE_METHODS = ['log', 'info', 'debug', 'dir', 'table', 'trace', 'group', 'groupCollapsed', 'count', 'timeEnd', 'timeLog'] as const;
+/**
+ * Console methods that write to stdout in Node, and so must never reach it.
+ * `console.error`, `console.warn`, and `console.trace` write to stderr and are
+ * deliberately absent; `console.dirxml` is an alias of `console.log` and is not.
+ *
+ * Exported so the test can exercise the exact list the guard patches.
+ */
+export const STDOUT_CONSOLE_METHODS = ['log', 'info', 'debug', 'dir', 'dirxml', 'table', 'group', 'groupCollapsed', 'count', 'timeEnd', 'timeLog'] as const;
 
 /**
  * Redirects every stdout-writing console method onto stderr.
  *
  * Call this before the transport is connected. It is a runtime backstop for code
  * we do not control — our own code is held to `no-console` by eslint.
+ *
+ * Known gap: a dependency calling `process.stdout.write` directly bypasses the
+ * console entirely and this guard with it. Only the smoke test — which asserts a
+ * real process emits nothing but JSON-RPC frames on stdout — catches that.
  *
  * @returns a function restoring the original methods, for tests
  */

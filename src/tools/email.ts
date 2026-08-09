@@ -32,6 +32,18 @@ const READ = 'Mail.Read';
 const WRITE = 'Mail.ReadWrite';
 const SEND = 'Mail.Send';
 
+/**
+ * `since`/`until` are interpolated verbatim into an OData `$filter`, so their
+ * shape is enforced here: only an ISO 8601 date or datetime can pass through,
+ * never an arbitrary filter fragment.
+ */
+const ISO_INSTANT = z
+  .string()
+  .regex(
+    /^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2}(\.\d{1,7})?)?(Z|[+-]\d{2}:\d{2})?)?$/,
+    'Expected an ISO 8601 date or datetime: YYYY-MM-DD or YYYY-MM-DDTHH:MM[:SS[.fff]][Z|±HH:MM].',
+  );
+
 interface GraphMessage {
   id: string;
   subject?: string;
@@ -74,7 +86,11 @@ const renderList = (
   heading: string,
   notes: readonly string[],
 ): string => {
-  if (messages.length === 0) return `No messages ${heading}.`;
+  // Notes must survive an empty result: "the unread filter was not applied" is
+  // most misleading exactly when nothing came back.
+  const noteBlock = notes.length ? `\n\n${notes.map((n) => `Note: ${n}`).join('\n')}` : '';
+
+  if (messages.length === 0) return `No messages ${heading}.${noteBlock}`;
 
   const lines = messages.map((message, index) =>
     [
@@ -89,10 +105,7 @@ const renderList = (
       .join('\n'),
   );
 
-  return (
-    `${messages.length} message(s) ${heading}:\n\n${lines.join('\n\n')}` +
-    (notes.length ? `\n\n${notes.map((n) => `Note: ${n}`).join('\n')}` : '')
-  );
+  return `${messages.length} message(s) ${heading}:\n\n${lines.join('\n\n')}${noteBlock}`;
 };
 
 /* -------------------------------------------------------------------------- */
@@ -124,7 +137,12 @@ const listEmails = defineTool({
         $top: count,
         $select: MESSAGE_LIST_SELECT,
         $orderby: 'receivedDateTime desc',
-        ...(args.unreadOnly ? { $filter: 'isRead eq false' } : {}),
+        // Graph requires every $orderby property to appear in $filter before any
+        // clause on another property, or the request 400s with InefficientFilter
+        // — hence the always-true receivedDateTime clause in front of isRead.
+        ...(args.unreadOnly
+          ? { $filter: 'receivedDateTime ge 1900-01-01T00:00:00Z and isRead eq false' }
+          : {}),
       },
       count,
     );
@@ -161,8 +179,8 @@ const searchEmails = defineTool({
     subject: z.string().optional(),
     hasAttachments: z.boolean().optional(),
     unreadOnly: z.boolean().optional(),
-    since: z.string().optional().describe('ISO 8601 lower bound on received time'),
-    until: z.string().optional().describe('ISO 8601 upper bound'),
+    since: ISO_INSTANT.optional().describe('ISO 8601 lower bound on received time'),
+    until: ISO_INSTANT.optional().describe('ISO 8601 upper bound'),
     folder: FOLDER_ARG.optional(),
     count: z.number().int().min(1).max(50).optional().describe('Default 10'),
   },
@@ -310,28 +328,42 @@ const deleteEmail = defineTool({
       .optional()
       .describe('Delete outright instead of moving to Deleted Items. Default false.'),
   },
-  output: { id: z.string(), subject: z.string(), permanent: z.boolean() },
+  output: {
+    id: z.string(),
+    subject: z.string(),
+    permanent: z.boolean(),
+    /** The id after a soft delete — moving a message changes its id. */
+    newId: z.string().optional(),
+  },
   handler: async (args, ctx) => {
     const message = await ctx.graph.get<GraphMessage>(messagePath(args.id), {
       $select: 'id,subject',
     });
 
+    let newId: string | undefined;
     if (args.permanent) {
       await ctx.graph.delete(messagePath(args.id));
     } else {
-      await ctx.graph.post(`${messagePath(args.id)}/move`, { destinationId: 'deleteditems' });
+      // The move response is the moved message, carrying the new id the old
+      // one is no longer valid for.
+      const movedTo = await ctx.graph.post<{ id?: string }>(`${messagePath(args.id)}/move`, {
+        destinationId: 'deleteditems',
+      });
+      newId = movedTo.id;
     }
 
     return {
       id: args.id,
       subject: message.subject ?? args.id,
       permanent: args.permanent === true,
+      ...(newId ? { newId } : {}),
     };
   },
   render: (data) =>
     data.permanent
       ? `"${data.subject}" has been permanently deleted.`
-      : `"${data.subject}" has been moved to Deleted Items.`,
+      : `"${data.subject}" has been moved to Deleted Items.\n` +
+        `Note: moving a message changes its id${data.newId ? ` — it is now ${data.newId}` : ''}.`,
 });
 
 /* -------------------------------------------------------------------------- */
@@ -399,7 +431,9 @@ const sendDraft = defineTool({
     'Sends an existing draft. Irreversible and visible to the recipients — the response ' +
     'names everyone it went to, including BCC, so it can be checked against what was asked ' +
     'for. Pairs with draft-email for compose, review, send.',
-  scopes: [SEND],
+  // READ as well as SEND: the handler reads the draft before sending, and
+  // Mail.Send does not imply Mail.Read.
+  scopes: [READ, SEND],
   annotations: { destructiveHint: true },
   input: { messageId: z.string().describe('Draft id from draft-email, or from list-emails on drafts') },
   output: {

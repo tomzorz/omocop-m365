@@ -105,6 +105,15 @@ export function explainGraphError(error: GraphError): string | undefined {
     );
   }
 
+  // Checked before the generic 404: Graph delivers this code with HTTP 404, and
+  // the id-container guidance below would otherwise answer first, wrongly.
+  if (code.includes('mailboxnotenabledforrestapi')) {
+    return (
+      'This mailbox is not reachable through the Graph REST API. That normally means the ' +
+      'account is not a mailbox-enabled Microsoft 365 or Outlook.com account.'
+    );
+  }
+
   if (error.status === 404) {
     return (
       'Not found. If the id came from a listing, check it is being used against the same ' +
@@ -131,13 +140,6 @@ export function explainGraphError(error: GraphError): string | undefined {
     );
   }
 
-  if (code.includes('mailboxnotenabledforrestapi')) {
-    return (
-      'This mailbox is not reachable through the Graph REST API. That normally means the ' +
-      'account is not a mailbox-enabled Microsoft 365 or Outlook.com account.'
-    );
-  }
-
   return undefined;
 }
 
@@ -145,7 +147,8 @@ export function explainGraphError(error: GraphError): string | undefined {
 export function describeGraphError(error: GraphError): string {
   const guidance = explainGraphError(error);
   const correlation = error.requestId ? `\n\nGraph request id: ${error.requestId}` : '';
-  return guidance
-    ? `${error.graphMessage}\n\n${guidance}${correlation}`
-    : `${error.graphMessage}${correlation}`;
+  // A bare 500 or 502 can arrive with an empty body, and Graph's own message is
+  // then blank; the constructed message at least names the request and status.
+  const base = error.graphMessage.trim() ? error.graphMessage : error.message;
+  return guidance ? `${base}\n\n${guidance}${correlation}` : `${base}${correlation}`;
 }

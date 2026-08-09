@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'vitest';
+import { z } from 'zod';
 import { emailTools } from '../../src/tools/email.js';
 import { runTool } from '../../src/server/tool.js';
 import type { AnyToolDefinition } from '../../src/server/registry.js';
@@ -70,6 +71,23 @@ describe('list-emails', () => {
     expect(text).toContain('[attachments]');
     expect(text).toContain('Alice <alice@example.com>');
     expect(text).toContain('ID: msg1');
+  });
+
+  /**
+   * Graph rejects `$filter=isRead eq false` next to `$orderby=receivedDateTime`
+   * with 400 InefficientFilter: every $orderby property must lead the $filter.
+   * The fake enforces the same rule, so this passing means the shape is legal.
+   */
+  test('unreadOnly filters with the orderby property leading the filter', async () => {
+    const { result, of } = await call(
+      'list-emails',
+      { unreadOnly: true },
+      on('COLLECT', 'me/messages', { items: [MESSAGE], truncated: false }),
+    );
+    expect(result.isError).toBeUndefined();
+    const filter = String(of('COLLECT')[0]?.query?.['$filter']);
+    expect(filter).toMatch(/^receivedDateTime ge /);
+    expect(filter).toContain('isRead eq false');
   });
 
   test('uses a well-known folder name directly, without walking the tree', async () => {
@@ -198,6 +216,54 @@ describe('search-emails', () => {
     );
     expect(text).toContain('unread-only filter cannot be combined');
   });
+
+  /**
+   * The not-applied note must survive an empty result — that is exactly when
+   * "no unread matches" would otherwise be read into a search that never
+   * filtered on unread at all.
+   */
+  test('an empty result still reports a criterion that was not applied', async () => {
+    const { text } = await call(
+      'search-emails',
+      { query: 'x', unreadOnly: true },
+      on('COLLECT', 'me/messages', { items: [], truncated: false }),
+    );
+    expect(text).toContain('No messages');
+    expect(text).toContain('unread-only filter cannot be combined');
+  });
+
+  /**
+   * `since`/`until` end up interpolated into an OData `$filter`, so the input
+   * schema — which the MCP SDK enforces before the handler runs — must reject
+   * anything that is not an ISO 8601 date or datetime. A value smuggling in a
+   * filter fragment never reaches Graph.
+   */
+  test('a malformed since is rejected by input validation, before any Graph call', () => {
+    const schema = z.object(tool('search-emails').input as z.ZodRawShape);
+    const parsed = schema.safeParse({
+      since: "2026-08-01T00:00:00Z and from/emailAddress/address eq 'x'",
+    });
+    expect(parsed.success).toBe(false);
+    if (!parsed.success) {
+      expect(parsed.error.issues[0]?.message).toContain('ISO 8601');
+    }
+  });
+
+  test('well-formed since and until values pass input validation', () => {
+    const schema = z.object(tool('search-emails').input as z.ZodRawShape);
+    for (const value of ['2026-08-01', '2026-08-01T09:30', '2026-08-01T09:30:00Z', '2026-08-01T09:30:00.123+02:00']) {
+      expect(schema.safeParse({ since: value, until: value }).success, value).toBe(true);
+    }
+  });
+
+  test('a non-date criterion still yields a filter starting with receivedDateTime', async () => {
+    const { of } = await call(
+      'search-emails',
+      { unreadOnly: true },
+      on('COLLECT', 'me/messages', { items: [], truncated: false }),
+    );
+    expect(String(of('COLLECT')[0]?.query?.['$filter'])).toMatch(/^receivedDateTime ge /);
+  });
 });
 
 describe('read-email', () => {
@@ -288,6 +354,24 @@ describe('mark-as-read and delete-email', () => {
     expect(text).toContain('moved to Deleted Items');
   });
 
+  /**
+   * A soft delete is a move, and a move changes the message id — the response
+   * must hand back the id that is still valid, and say the old one is not.
+   */
+  test('delete-email returns the post-move id and warns the id changed', async () => {
+    const { text, result } = await call(
+      'delete-email',
+      { id: 'msg1' },
+      on('GET', 'me/messages/msg1', { id: 'msg1', subject: 'Q3 numbers' }),
+      on('POST', '/move', { id: 'msg1-in-trash' }),
+    );
+    const data = result.structuredContent as { id: string; newId?: string };
+    expect(data.newId).toBe('msg1-in-trash');
+    expect(data.newId).not.toBe(data.id);
+    expect(text).toContain('changes its id');
+    expect(text).toContain('msg1-in-trash');
+  });
+
   test('delete-email removes outright when asked', async () => {
     const { of, text } = await call(
       'delete-email',
@@ -331,6 +415,34 @@ describe('draft-email', () => {
       on('POST', 'me/messages', { id: 'd' }),
     );
     expect((of('POST')[0]?.body as { toRecipients: unknown[] }).toRecipients).toHaveLength(3);
+  });
+
+  /**
+   * "Name <address>" as a literal address is rejected by Graph at send time —
+   * the address goes in the address field, the name in the name field.
+   */
+  test('parses "Name <address>" into address plus display name', async () => {
+    const { of } = await call(
+      'draft-email',
+      { to: 'Bob Smith <bob@x.com>, alice@x.com', subject: 's' },
+      on('POST', 'me/messages', { id: 'd' }),
+    );
+    expect((of('POST')[0]?.body as { toRecipients: unknown[] }).toRecipients).toEqual([
+      { emailAddress: { address: 'bob@x.com', name: 'Bob Smith' } },
+      { emailAddress: { address: 'alice@x.com' } },
+    ]);
+  });
+
+  test('a comma inside a quoted display name does not split the entry', async () => {
+    const { of } = await call(
+      'draft-email',
+      { to: '"Smith, Bob" <bob@x.com>, alice@x.com', subject: 's' },
+      on('POST', 'me/messages', { id: 'd' }),
+    );
+    expect((of('POST')[0]?.body as { toRecipients: unknown[] }).toRecipients).toEqual([
+      { emailAddress: { address: 'bob@x.com', name: 'Smith, Bob' } },
+      { emailAddress: { address: 'alice@x.com' } },
+    ]);
   });
 });
 
@@ -415,6 +527,12 @@ describe('the tool set', () => {
 
   test('draft-email needs no send scope, because it sends nothing', () => {
     expect(tool('draft-email').scopes).not.toContain('Mail.Send');
+  });
+
+  test('send-draft declares the read scope its pre-send GET needs', () => {
+    // The handler reads the draft before sending, and Mail.Send does not
+    // imply Mail.Read.
+    expect(tool('send-draft').scopes).toContain('Mail.Read');
   });
 
   test('read-only tools are annotated', () => {

@@ -1,0 +1,9 @@
+{
+  "targetDir": "~/.claude/skills",
+  "userName": "Alex",
+  "personalCalendar": "Alex Example",
+  "managedCalendar": "Agent Managed",
+  "agentMailbox": "agent.account@example.com",
+  "downloadDir": "~/Downloads",
+  "mcpServerName": "omocop-m365"
+}
