@@ -62,6 +62,10 @@ create-event  subject: <text>  start: <ISO>  end: <ISO>  calendar: "{{MANAGED_CA
 
 Times are handled by the server: a naive `2026-08-15T14:00:00` means 2pm in the configured timezone, and a `Z` or `+02:00` timestamp is honoured as that exact instant. Either form is safe. The response states the time and zone it actually scheduled; check that line, it is the cheapest way to catch a misread request.
 
+If the user states a time in another zone ("3pm Eastern", "10am Tokyo time"), pass that zone as `timeZone` and keep the time naive, rather than converting the time yourself.
+
+For day-scoped entries (birthdays, holidays, travel days, "block Friday"), use `allDay: true` with date-only values; the end date is inclusive. An all-day event blocks the whole day as busy unless `showAs: "free"` is passed, and for birthday-style entries free is almost always what is meant — block the day as busy only when the user wants the day actually reserved.
+
 Before creating an event, read the same window first and mention any overlap. Do not refuse to double-book, just say what it collides with.
 
 `{{PERSONAL_CALENDAR}}` is read-only. Any attempt to create there fails with a read-only message. If {{USER_NAME}} asks to add something "to my calendar", use `{{MANAGED_CALENDAR}}` without asking. If they explicitly name `{{PERSONAL_CALENDAR}}`, tell them it cannot be written to via this route.

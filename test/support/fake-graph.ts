@@ -9,6 +9,7 @@ export interface GraphCall {
   readonly query?: Record<string, unknown>;
   readonly body?: unknown;
   readonly limit?: number;
+  readonly headers?: Record<string, string>;
 }
 
 /** Answers a call, or returns undefined to fall through to the next responder. */
@@ -95,10 +96,21 @@ export function fakeGraph(...responders: Responder[]) {
   };
 
   const graph = {
-    get: async (path: string, query?: Record<string, unknown>) =>
-      answer({ method: 'GET', path, ...(query ? { query } : {}) }),
-    collect: async (path: string, query?: Record<string, unknown>, limit?: number) =>
-      answer({ method: 'COLLECT', path, ...(query ? { query } : {}), ...(limit !== undefined ? { limit } : {}) }),
+    get: async (path: string, query?: Record<string, unknown>, headers?: Record<string, string>) =>
+      answer({ method: 'GET', path, ...(query ? { query } : {}), ...(headers ? { headers } : {}) }),
+    collect: async (
+      path: string,
+      query?: Record<string, unknown>,
+      limit?: number,
+      headers?: Record<string, string>,
+    ) =>
+      answer({
+        method: 'COLLECT',
+        path,
+        ...(query ? { query } : {}),
+        ...(limit !== undefined ? { limit } : {}),
+        ...(headers ? { headers } : {}),
+      }),
     post: async (path: string, body?: unknown) => answer({ method: 'POST', path, body }),
     patch: async (path: string, body: unknown) => answer({ method: 'PATCH', path, body }),
     delete: async (path: string) => {

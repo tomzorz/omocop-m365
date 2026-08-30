@@ -34,6 +34,15 @@ const ISO_SHAPE =
 export type DateTimeInput = string | { dateTime?: string; timeZone?: string } | undefined;
 
 /**
+ * True when the timestamp carries `Z` or a numeric offset — the instant is
+ * already fixed, so pairing it with a named zone would be contradictory.
+ */
+export function hasExplicitOffset(text: string): boolean {
+  const match = ISO_SHAPE.exec(text.trim());
+  return match?.[3] !== undefined;
+}
+
+/**
  * Normalises a date/time argument into Graph's shape.
  *
  * @param label argument name, for the message when it is not a date at all

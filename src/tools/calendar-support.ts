@@ -31,7 +31,7 @@ export interface Calendar {
 const CALENDAR_SELECT = 'id,name,isDefaultCalendar,canEdit,owner';
 
 /** Fields the recurrence decision and the response text need. */
-export const EVENT_FACTS_SELECT = 'id,subject,type,seriesMasterId,start';
+export const EVENT_FACTS_SELECT = 'id,subject,type,seriesMasterId,start,isAllDay';
 
 /** Reusable argument fragments, so every calendar tool describes them the same way. */
 export const CALENDAR_ARG = z

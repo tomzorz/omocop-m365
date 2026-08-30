@@ -9,7 +9,14 @@
 import { z } from 'zod';
 import { defineTool } from '../server/tool.js';
 import type { AnyToolDefinition } from '../server/registry.js';
-import { toGraphDateTime, describeDateTime, datePart } from '../domain/datetime.js';
+import { describeDateTime, datePart, type GraphDateTime } from '../domain/datetime.js';
+import {
+  allDayBoundaries,
+  allDaySpanOf,
+  resolveAllDaySpan,
+  resolveTimedBoundary,
+  rezoneBoundaries,
+} from '../domain/event-schedule.js';
 import { scopeNote, type ScopeResolution } from '../domain/recurrence.js';
 import {
   CALENDAR_ARG,
@@ -30,12 +37,27 @@ import {
 const READ = 'Calendars.Read';
 const WRITE = 'Calendars.ReadWrite';
 
+/** The writable free/busy values. Graph can additionally *report* `unknown`. */
+const SHOW_AS = z
+  .enum(['free', 'tentative', 'busy', 'oof', 'workingElsewhere'])
+  .describe('How the event shows in free/busy lookups. Graph defaults to busy when omitted.');
+
+const TIMEZONE_ARG = z
+  .string()
+  .describe(
+    'Windows or IANA timezone name for start/end times given without an offset. ' +
+      'Defaults to the configured timezone.',
+  );
+
 /** Shape of an event as the listing renders it. */
 const EventSummary = z.object({
   id: z.string(),
   subject: z.string(),
   start: z.string(),
   end: z.string(),
+  isAllDay: z.boolean(),
+  showAs: z.string().optional(),
+  originalTimeZone: z.string().optional(),
   location: z.string().optional(),
   calendar: z.string().optional(),
   attendees: z.array(z.string()),
@@ -99,6 +121,9 @@ interface GraphEvent {
   location?: { displayName?: string };
   attendees?: Array<{ emailAddress?: { address?: string } }>;
   type?: string;
+  isAllDay?: boolean;
+  showAs?: string;
+  originalStartTimeZone?: string;
 }
 
 const listEvents = defineTool({
@@ -154,25 +179,42 @@ const listEvents = defineTool({
         // would cost ~5 sequential round trips instead of one.
         $top: count,
         $orderby: 'start/dateTime',
-        $select: 'id,subject,bodyPreview,start,end,location,attendees,type',
+        $select:
+          'id,subject,bodyPreview,start,end,location,attendees,type,' +
+          'isAllDay,showAs,originalStartTimeZone',
       },
       count,
+      // Without this, Graph answers in UTC regardless of where the events live.
+      // All-day boundaries are exempt: Graph returns their original date at
+      // 00:00:00 in any requested zone, which is what makes allDaySpanOf safe.
+      { Prefer: `outlook.timezone="${ctx.config.timezone}"` },
     );
 
     return {
-      events: items.map((event) => ({
-        id: event.id,
-        subject: event.subject ?? '(no subject)',
-        start: describeDateTime(event.start as never),
-        end: describeDateTime(event.end as never),
-        ...(event.location?.displayName ? { location: event.location.displayName } : {}),
-        ...(calendar ? { calendar: calendar.name } : {}),
-        attendees: (event.attendees ?? [])
-          .map((a) => a.emailAddress?.address)
-          .filter((a): a is string => Boolean(a)),
-        isRecurring: (event.type ?? 'singleInstance') !== 'singleInstance',
-        ...(event.bodyPreview ? { preview: event.bodyPreview.slice(0, 200) } : {}),
-      })),
+      events: items.map((event) => {
+        const allDay = event.isAllDay === true;
+        const span = allDay ? allDaySpanOf(event.start, event.end) : undefined;
+        return {
+          id: event.id,
+          subject: event.subject ?? '(no subject)',
+          // All-day events read back as the inclusive dates the write side
+          // accepts, not as midnight timestamps with an exclusive end.
+          start: span ? span.startDate : describeDateTime(event.start as never),
+          end: span ? span.endDate : describeDateTime(event.end as never),
+          isAllDay: allDay,
+          ...(event.showAs ? { showAs: event.showAs } : {}),
+          ...(event.originalStartTimeZone
+            ? { originalTimeZone: event.originalStartTimeZone }
+            : {}),
+          ...(event.location?.displayName ? { location: event.location.displayName } : {}),
+          ...(calendar ? { calendar: calendar.name } : {}),
+          attendees: (event.attendees ?? [])
+            .map((a) => a.emailAddress?.address)
+            .filter((a): a is string => Boolean(a)),
+          isRecurring: (event.type ?? 'singleInstance') !== 'singleInstance',
+          ...(event.bodyPreview ? { preview: event.bodyPreview.slice(0, 200) } : {}),
+        };
+      }),
       window: {
         start: start.toISOString(),
         end: end.toISOString(),
@@ -193,8 +235,14 @@ const listEvents = defineTool({
     const lines = data.events.map((event, index) => {
       const parts = [
         `${index + 1}. ${event.subject}`,
-        `   ${event.start} → ${event.end}`,
+        event.isAllDay
+          ? event.start === event.end
+            ? `   All day on ${event.start}`
+            : `   All day, ${event.start} through ${event.end}`
+          : `   ${event.start} → ${event.end}`,
       ];
+      // "busy" is Graph's default; only a deviation from it is worth a line.
+      if (event.showAs && event.showAs !== 'busy') parts.push(`   Shows as: ${event.showAs}`);
       if (event.location) parts.push(`   Location: ${event.location}`);
       if (event.attendees.length) parts.push(`   Attendees: ${event.attendees.join(', ')}`);
       if (event.isRecurring) {
@@ -218,13 +266,25 @@ const createEvent = defineTool({
   title: 'Create a calendar event',
   description:
     'Creates an event. Times without a timezone offset are read in the configured ' +
-    'timezone; a timestamp carrying Z or an offset is honoured as that exact instant. ' +
-    'The response states which was used.',
+    'timezone (or the given timeZone); a timestamp carrying Z or an offset is honoured ' +
+    'as that exact instant. The response states which was used. For an all-day event ' +
+    'pass allDay with date-only start/end, and showAs "free" unless it should block the day.',
   scopes: [WRITE],
   input: {
     subject: z.string().min(1),
-    start: z.string().describe('ISO 8601 start, e.g. 2026-08-15T14:00:00'),
-    end: z.string().describe('ISO 8601 end'),
+    start: z
+      .string()
+      .describe('ISO 8601 start, e.g. 2026-08-15T14:00:00. Date-only (2026-08-15) with allDay.'),
+    end: z
+      .string()
+      .optional()
+      .describe('ISO 8601 end. With allDay: inclusive last day, defaults to start.'),
+    allDay: z
+      .boolean()
+      .optional()
+      .describe('All-day event. start/end must then be date-only; end is inclusive.'),
+    timeZone: TIMEZONE_ARG.optional(),
+    showAs: SHOW_AS.optional(),
     location: z.string().optional().describe('Room, address, venue, or meeting link'),
     body: z.string().optional(),
     attendees: z.array(z.string()).optional().describe('Email addresses to invite'),
@@ -236,6 +296,8 @@ const createEvent = defineTool({
     start: z.string(),
     end: z.string(),
     timeZone: z.string(),
+    allDay: z.boolean(),
+    showAs: SHOW_AS.optional(),
     location: z.string().optional(),
     calendar: z.string().optional(),
     invited: z.number(),
@@ -243,19 +305,35 @@ const createEvent = defineTool({
   policies: [requireCalendar({ mustBeWritable: true })],
   handler: async (args, ctx) => {
     const calendar = resolvedCalendar(ctx);
+    const allDay = args.allDay === true;
 
-    const start = toGraphDateTime(args.start, ctx.config.timezone, 'start time');
-    if (!start.ok) throw new Error(start.message);
-    const end = toGraphDateTime(args.end, ctx.config.timezone, 'end time');
-    if (!end.ok) throw new Error(end.message);
+    let schedule: { isAllDay?: true; start: GraphDateTime; end: GraphDateTime };
+    let echo: { start: string; end: string };
+
+    if (allDay) {
+      const span = resolveAllDaySpan(args.start, args.end);
+      if (!span.ok) throw new Error(span.message);
+      schedule = allDayBoundaries(span.value, args.timeZone ?? ctx.config.timezone);
+      echo = { start: span.value.startDate, end: span.value.endDate };
+    } else {
+      if (args.end === undefined) throw new Error('An end time is required for a timed event.');
+      const start = resolveTimedBoundary(args.start, args.timeZone, ctx.config.timezone, 'start time');
+      if (!start.ok) throw new Error(start.message);
+      const end = resolveTimedBoundary(args.end, args.timeZone, ctx.config.timezone, 'end time');
+      if (!end.ok) throw new Error(end.message);
+      schedule = { start: start.value, end: end.value };
+      echo = { start: start.value.dateTime, end: end.value.dateTime };
+    }
 
     const location = args.location?.trim();
     const attendees = (args.attendees ?? []).map((entry) => toAttendee(entry));
 
     const created = await ctx.graph.post<{ id: string; subject?: string }>(eventsPath(calendar), {
       subject: args.subject,
-      start: start.value,
-      end: end.value,
+      start: schedule.start,
+      end: schedule.end,
+      ...(schedule.isAllDay ? { isAllDay: true } : {}),
+      ...(args.showAs ? { showAs: args.showAs } : {}),
       body: { contentType: 'HTML', content: args.body ?? '' },
       ...(location ? { location: { displayName: location } } : {}),
       ...(attendees.length ? { attendees } : {}),
@@ -264,9 +342,11 @@ const createEvent = defineTool({
     return {
       id: created.id,
       subject: created.subject ?? args.subject,
-      start: start.value.dateTime,
-      end: end.value.dateTime,
-      timeZone: start.value.timeZone,
+      start: echo.start,
+      end: echo.end,
+      timeZone: schedule.start.timeZone,
+      allDay,
+      ...(args.showAs ? { showAs: args.showAs } : {}),
       ...(location ? { location } : {}),
       ...(calendar ? { calendar: calendar.name } : {}),
       invited: attendees.length,
@@ -275,7 +355,12 @@ const createEvent = defineTool({
   render: (data) =>
     `Created "${data.subject}"${data.calendar ? ` in "${data.calendar}"` : ''}` +
     `${data.location ? ` at ${data.location}` : ''}.\n` +
-    `Scheduled for ${data.start} to ${data.end} (${data.timeZone}).` +
+    (data.allDay
+      ? data.start === data.end
+        ? `All day on ${data.start}.`
+        : `All day, ${data.start} through ${data.end} (both inclusive).`
+      : `Scheduled for ${data.start} to ${data.end} (${data.timeZone}).`) +
+    (data.showAs ? `\nShows as ${data.showAs}.` : '') +
     (data.invited ? `\nInvitations sent to ${data.invited} attendee(s).` : '') +
     `\nID: ${data.id}`,
 });
@@ -294,8 +379,23 @@ const updateEvent = defineTool({
     eventId: z.string().describe('Event id, from a list-events result'),
     scope: SCOPE_ARG.optional(),
     subject: z.string().optional(),
-    start: z.string().optional().describe('New ISO 8601 start. Pass end too when moving.'),
-    end: z.string().optional(),
+    start: z
+      .string()
+      .optional()
+      .describe('New ISO 8601 start. Pass end too when moving. Date-only for all-day events.'),
+    end: z.string().optional().describe('New ISO 8601 end. Inclusive date for all-day events.'),
+    allDay: z
+      .boolean()
+      .optional()
+      .describe(
+        'true converts to all-day (date-only start required); false converts back ' +
+          '(start and end with times required).',
+      ),
+    timeZone: TIMEZONE_ARG.optional().describe(
+      'Zone for naive start/end times. Alone, with no start/end, it re-zones the event: ' +
+        'wall-clock times stay, the instant moves.',
+    ),
+    showAs: SHOW_AS.optional(),
     location: z.string().optional().describe('Pass an empty string to clear it'),
     body: z.string().optional(),
     attendees: z
@@ -334,15 +434,124 @@ const updateEvent = defineTool({
       changes.push(`subject to "${args.subject}"`);
     }
 
-    for (const [key, value, label] of [
-      ['start', args.start, 'start time'],
-      ['end', args.end, 'end time'],
-    ] as const) {
-      if (value === undefined) continue;
-      const parsed = toGraphDateTime(value, ctx.config.timezone, label);
-      if (!parsed.ok) throw new Error(parsed.message);
-      update[key] = parsed.value;
-      changes.push(`${key} to ${parsed.value.dateTime} (${parsed.value.timeZone})`);
+    if (args.showAs !== undefined) {
+      update['showAs'] = args.showAs;
+      changes.push(`shows as ${args.showAs}`);
+    }
+
+    const targetAllDay = target.event.isAllDay === true;
+    const editingTimes = args.start !== undefined || args.end !== undefined;
+
+    if (editingTimes || args.allDay !== undefined) {
+      // An event edited without an allDay flag stays what it is.
+      if (args.allDay ?? targetAllDay) {
+        if (!editingTimes) {
+          // allDay:true with no dates: a conversion has nothing to convert to,
+          // and restating an all-day event's nature changes nothing.
+          if (!targetAllDay) {
+            throw new Error(
+              'Converting to all-day needs a date-only start (YYYY-MM-DD); end is ' +
+                'optional and names the inclusive last day.',
+            );
+          }
+        } else {
+          let startDate = args.start;
+          let endDate = args.end;
+          // Editing one boundary of an existing all-day event keeps the other
+          // as stored. (A conversion from timed needs no fetch: a missing end
+          // defaults to the start date.)
+          if ((startDate === undefined || endDate === undefined) && targetAllDay) {
+            const stored = await ctx.graph.get<{
+              start?: { dateTime?: string };
+              end?: { dateTime?: string };
+            }>(eventPath(target.calendar, target.targetId), { $select: 'start,end' });
+            const span = allDaySpanOf(stored.start, stored.end);
+            startDate ??= span.startDate;
+            endDate ??= span.endDate;
+          }
+          const span = resolveAllDaySpan(startDate, endDate);
+          if (!span.ok) throw new Error(span.message);
+          const bounds = allDayBoundaries(span.value, args.timeZone ?? ctx.config.timezone);
+          update['isAllDay'] = true;
+          update['start'] = bounds.start;
+          update['end'] = bounds.end;
+          changes.push(
+            span.value.startDate === span.value.endDate
+              ? `all day on ${span.value.startDate}`
+              : `all day, ${span.value.startDate} through ${span.value.endDate} (inclusive)`,
+          );
+        }
+      } else if (args.allDay === false && targetAllDay) {
+        // Graph rejects a partial flip, so becoming timed needs both boundaries.
+        if (args.start === undefined || args.end === undefined) {
+          const missing = [
+            ...(args.start === undefined ? ['start'] : []),
+            ...(args.end === undefined ? ['end'] : []),
+          ];
+          throw new Error(
+            `Converting an all-day event to a timed one needs times of day: ` +
+              `also pass ${missing.join(' and ')}.`,
+          );
+        }
+        const start = resolveTimedBoundary(args.start, args.timeZone, ctx.config.timezone, 'start time');
+        if (!start.ok) throw new Error(start.message);
+        const end = resolveTimedBoundary(args.end, args.timeZone, ctx.config.timezone, 'end time');
+        if (!end.ok) throw new Error(end.message);
+        update['isAllDay'] = false;
+        update['start'] = start.value;
+        update['end'] = end.value;
+        changes.push(`timed: ${start.value.dateTime} to ${end.value.dateTime} (${start.value.timeZone})`);
+      } else {
+        for (const [key, value, label] of [
+          ['start', args.start, 'start time'],
+          ['end', args.end, 'end time'],
+        ] as const) {
+          if (value === undefined) continue;
+          const parsed = resolveTimedBoundary(value, args.timeZone, ctx.config.timezone, label);
+          if (!parsed.ok) throw new Error(parsed.message);
+          update[key] = parsed.value;
+          changes.push(`${key} to ${parsed.value.dateTime} (${parsed.value.timeZone})`);
+        }
+      }
+    } else if (args.timeZone !== undefined) {
+      // A zone with no new times re-zones the event: wall-clock times are kept
+      // and the instant moves, the reading the Outlook timezone picker uses.
+      if (targetAllDay) {
+        throw new Error(
+          'An all-day event has no clock time to re-zone — its boundaries are dates. ' +
+            'Edit the dates instead.',
+        );
+      }
+      // The stored wall-clock times only exist relative to the zone the event
+      // was created in, so that zone must be read first and then asked for.
+      const zoned = await ctx.graph.get<{ originalStartTimeZone?: string }>(
+        eventPath(target.calendar, target.targetId),
+        { $select: 'originalStartTimeZone' },
+      );
+      const oldZone = zoned.originalStartTimeZone;
+      if (!oldZone) {
+        throw new Error(
+          'The event does not state the timezone it was created in, so its wall-clock ' +
+            'times cannot be re-zoned safely. Pass explicit start and end times instead.',
+        );
+      }
+      const stored = await ctx.graph.get<{
+        start?: { dateTime?: string };
+        end?: { dateTime?: string };
+      }>(
+        eventPath(target.calendar, target.targetId),
+        { $select: 'start,end' },
+        { Prefer: `outlook.timezone="${oldZone}"` },
+      );
+      if (!stored.start?.dateTime || !stored.end?.dateTime) {
+        throw new Error('Graph returned no boundaries for the event, so it cannot be re-zoned.');
+      }
+      const bounds = rezoneBoundaries(stored.start.dateTime, stored.end.dateTime, args.timeZone);
+      update['start'] = bounds.start;
+      update['end'] = bounds.end;
+      changes.push(
+        `timezone from ${oldZone} to ${args.timeZone} (wall-clock times kept, so the instant moved)`,
+      );
     }
 
     if (args.location !== undefined) {
@@ -398,8 +607,8 @@ const updateEvent = defineTool({
 
     if (changes.length === 0) {
       throw new Error(
-        'Nothing to update. Pass at least one of: subject, start, end, location, body, ' +
-          'attendees, addAttendees, removeAttendees.',
+        'Nothing to update. Pass at least one of: subject, start, end, allDay, timeZone, ' +
+          'showAs, location, body, attendees, addAttendees, removeAttendees.',
       );
     }
 

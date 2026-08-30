@@ -48,6 +48,7 @@ export interface EventFacts {
   readonly type?: string | undefined;
   readonly seriesMasterId?: string | undefined;
   readonly start?: { readonly dateTime?: string | undefined } | undefined;
+  readonly isAllDay?: boolean | undefined;
 }
 
 export type ScopeResolution =

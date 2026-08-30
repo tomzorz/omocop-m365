@@ -467,6 +467,346 @@ describe('accept-event and decline-event', () => {
   });
 });
 
+describe('list-events timezone, showAs and all-day', () => {
+  const events = {
+    items: [
+      {
+        id: 'e1',
+        subject: 'Standup',
+        start: { dateTime: '2026-08-05T09:00:00', timeZone: 'W. Europe Standard Time' },
+        end: { dateTime: '2026-08-05T09:15:00', timeZone: 'W. Europe Standard Time' },
+        showAs: 'tentative',
+        originalStartTimeZone: 'Pacific Standard Time',
+        type: 'singleInstance',
+      },
+    ],
+    truncated: false,
+  };
+
+  test('asks Graph for times in the configured zone, not UTC', async () => {
+    const { of } = await call('list-events', {}, on('COLLECT', 'calendarView', events));
+    expect(of('COLLECT')[0]?.headers).toEqual({
+      Prefer: 'outlook.timezone="W. Europe Standard Time"',
+    });
+  });
+
+  test('selects the new properties', async () => {
+    const { of } = await call('list-events', {}, on('COLLECT', 'calendarView', events));
+    const select = String(of('COLLECT')[0]?.query?.['$select']);
+    for (const field of ['isAllDay', 'showAs', 'originalStartTimeZone']) {
+      expect(select).toContain(field);
+    }
+  });
+
+  test('exposes showAs and the zone the event was created in', async () => {
+    const { result, text } = await call('list-events', {}, on('COLLECT', 'calendarView', events));
+    expect(result.structuredContent).toMatchObject({
+      events: [
+        { showAs: 'tentative', originalTimeZone: 'Pacific Standard Time', isAllDay: false },
+      ],
+    });
+    expect(text).toContain('Shows as: tentative');
+  });
+
+  test('stays quiet about the default showAs of busy', async () => {
+    const busy = { items: [{ ...events.items[0], showAs: 'busy' }], truncated: false };
+    const { text } = await call('list-events', {}, on('COLLECT', 'calendarView', busy));
+    expect(text).not.toContain('Shows as');
+  });
+
+  test('an all-day event reads back as its inclusive dates, not midnights', async () => {
+    const allDay = {
+      items: [
+        {
+          id: 'ad1',
+          subject: 'Conference',
+          isAllDay: true,
+          start: { dateTime: '2026-08-15T00:00:00.0000000', timeZone: 'W. Europe Standard Time' },
+          end: { dateTime: '2026-08-17T00:00:00.0000000', timeZone: 'W. Europe Standard Time' },
+          type: 'singleInstance',
+        },
+      ],
+      truncated: false,
+    };
+    const { result, text } = await call('list-events', {}, on('COLLECT', 'calendarView', allDay));
+    expect(result.structuredContent).toMatchObject({
+      events: [{ isAllDay: true, start: '2026-08-15', end: '2026-08-16' }],
+    });
+    expect(text).toContain('All day, 2026-08-15 through 2026-08-16');
+  });
+
+  test('a one-day all-day event names its single date', async () => {
+    const allDay = {
+      items: [
+        {
+          id: 'ad2',
+          subject: 'Holiday',
+          isAllDay: true,
+          start: { dateTime: '2026-08-20T00:00:00' },
+          end: { dateTime: '2026-08-21T00:00:00' },
+          type: 'singleInstance',
+        },
+      ],
+      truncated: false,
+    };
+    const { text } = await call('list-events', {}, on('COLLECT', 'calendarView', allDay));
+    expect(text).toContain('All day on 2026-08-20');
+  });
+});
+
+describe('create-event timezone, showAs and all-day', () => {
+  const created = { id: 'new1', subject: 'x' };
+
+  test('a per-event timeZone wins over the configured zone for naive times', async () => {
+    const { of, text } = await call(
+      'create-event',
+      {
+        subject: 'x',
+        start: '2026-08-15T14:00:00',
+        end: '2026-08-15T15:00:00',
+        timeZone: 'Tokyo Standard Time',
+      },
+      on('POST', 'me/events', created),
+    );
+    const body = of('POST')[0]?.body as { start: { timeZone: string }; end: { timeZone: string } };
+    expect(body.start.timeZone).toBe('Tokyo Standard Time');
+    expect(body.end.timeZone).toBe('Tokyo Standard Time');
+    expect(text).toContain('Tokyo Standard Time');
+  });
+
+  test('refuses a timeZone paired with an offset timestamp, and posts nothing', async () => {
+    const { text, of } = await call('create-event', {
+      subject: 'x',
+      start: '2026-08-15T14:00:00Z',
+      end: '2026-08-15T15:00:00Z',
+      timeZone: 'Tokyo Standard Time',
+    });
+    expect(text).toContain('already fixes the exact instant');
+    expect(of('POST')).toHaveLength(0);
+  });
+
+  test('passes showAs through and says so', async () => {
+    const { of, text } = await call(
+      'create-event',
+      { subject: 'x', start: '2026-08-15T14:00:00', end: '2026-08-15T15:00:00', showAs: 'oof' },
+      on('POST', 'me/events', created),
+    );
+    expect(of('POST')[0]?.body).toMatchObject({ showAs: 'oof' });
+    expect(text).toContain('Shows as oof');
+  });
+
+  test('does not send showAs when it was not given — Graph owns the default', async () => {
+    const { of } = await call(
+      'create-event',
+      { subject: 'x', start: '2026-08-15T14:00:00', end: '2026-08-15T15:00:00' },
+      on('POST', 'me/events', created),
+    );
+    expect(of('POST')[0]?.body).not.toHaveProperty('showAs');
+  });
+
+  test('an all-day event converts inclusive dates to exclusive midnights', async () => {
+    const { of, text } = await call(
+      'create-event',
+      { subject: 'x', allDay: true, start: '2026-08-15', end: '2026-08-16' },
+      on('POST', 'me/events', created),
+    );
+    expect(of('POST')[0]?.body).toMatchObject({
+      isAllDay: true,
+      start: { dateTime: '2026-08-15T00:00:00', timeZone: 'W. Europe Standard Time' },
+      end: { dateTime: '2026-08-17T00:00:00', timeZone: 'W. Europe Standard Time' },
+    });
+    expect(text).toContain('All day, 2026-08-15 through 2026-08-16');
+  });
+
+  test('a single date is a one-day all-day event', async () => {
+    const { of, text } = await call(
+      'create-event',
+      { subject: 'x', allDay: true, start: '2026-08-15' },
+      on('POST', 'me/events', created),
+    );
+    expect(of('POST')[0]?.body).toMatchObject({
+      end: { dateTime: '2026-08-16T00:00:00' },
+    });
+    expect(text).toContain('All day on 2026-08-15');
+  });
+
+  test('refuses a time-bearing start for an all-day event, before Graph', async () => {
+    const { text, of } = await call('create-event', {
+      subject: 'x',
+      allDay: true,
+      start: '2026-08-15T14:00:00',
+    });
+    expect(text).toContain('date-only');
+    expect(of('POST')).toHaveLength(0);
+  });
+
+  test('refuses an all-day end before the start', async () => {
+    const { text, of } = await call('create-event', {
+      subject: 'x',
+      allDay: true,
+      start: '2026-08-16',
+      end: '2026-08-15',
+    });
+    expect(text).toContain('before the start');
+    expect(of('POST')).toHaveLength(0);
+  });
+
+  test('a timed event still requires an end', async () => {
+    const { text, of } = await call('create-event', { subject: 'x', start: '2026-08-15T14:00:00' });
+    expect(text).toContain('end time is required');
+    expect(of('POST')).toHaveLength(0);
+  });
+});
+
+describe('update-event timezone, showAs and all-day', () => {
+  const ALLDAY = { id: 'ad1', subject: 'Conference', type: 'singleInstance', isAllDay: true };
+
+  test('patches showAs and reports it', async () => {
+    const { of, text } = await call(
+      'update-event',
+      { eventId: 'evt1', showAs: 'free' },
+      on('GET', 'me/events/evt1', SINGLE),
+      on('PATCH', 'me/events/evt1', {}),
+    );
+    expect(of('PATCH')[0]?.body).toEqual({ showAs: 'free' });
+    expect(text).toContain('shows as free');
+  });
+
+  test('a naive start with a timeZone lands in that zone', async () => {
+    const { of } = await call(
+      'update-event',
+      { eventId: 'evt1', start: '2026-08-15T14:00:00', timeZone: 'Tokyo Standard Time' },
+      on('GET', 'me/events/evt1', SINGLE),
+      on('PATCH', 'me/events/evt1', {}),
+    );
+    expect(of('PATCH')[0]?.body).toEqual({
+      start: { dateTime: '2026-08-15T14:00:00', timeZone: 'Tokyo Standard Time' },
+    });
+  });
+
+  test('timeZone alone re-zones: wall-clock kept, zone swapped', async () => {
+    const { of, text } = await call(
+      'update-event',
+      { eventId: 'evt1', timeZone: 'Tokyo Standard Time' },
+      (c) =>
+        c.method === 'GET' && c.query?.['$select'] === 'originalStartTimeZone'
+          ? { originalStartTimeZone: 'W. Europe Standard Time' }
+          : undefined,
+      (c) =>
+        c.method === 'GET' && c.query?.['$select'] === 'start,end'
+          ? {
+              start: { dateTime: '2026-08-15T14:00:00.0000000', timeZone: 'W. Europe Standard Time' },
+              end: { dateTime: '2026-08-15T15:00:00.0000000', timeZone: 'W. Europe Standard Time' },
+            }
+          : undefined,
+      on('GET', 'me/events/evt1', SINGLE),
+      on('PATCH', 'me/events/evt1', {}),
+    );
+
+    // The wall-clock read must happen in the zone the event was created in.
+    const boundariesRead = of('GET').find((c) => c.query?.['$select'] === 'start,end');
+    expect(boundariesRead?.headers).toEqual({
+      Prefer: 'outlook.timezone="W. Europe Standard Time"',
+    });
+    expect(of('PATCH')[0]?.body).toEqual({
+      start: { dateTime: '2026-08-15T14:00:00.0000000', timeZone: 'Tokyo Standard Time' },
+      end: { dateTime: '2026-08-15T15:00:00.0000000', timeZone: 'Tokyo Standard Time' },
+    });
+    expect(text).toContain('wall-clock times kept');
+  });
+
+  test('refuses to re-zone an all-day event', async () => {
+    const { text, of } = await call(
+      'update-event',
+      { eventId: 'ad1', timeZone: 'Tokyo Standard Time' },
+      on('GET', 'me/events/ad1', ALLDAY),
+    );
+    expect(text).toContain('no clock time to re-zone');
+    expect(of('PATCH')).toHaveLength(0);
+  });
+
+  test('converts a timed event to all-day with one date', async () => {
+    const { of, text } = await call(
+      'update-event',
+      { eventId: 'evt1', allDay: true, start: '2026-08-15' },
+      on('GET', 'me/events/evt1', SINGLE),
+      on('PATCH', 'me/events/evt1', {}),
+    );
+    expect(of('PATCH')[0]?.body).toEqual({
+      isAllDay: true,
+      start: { dateTime: '2026-08-15T00:00:00', timeZone: 'W. Europe Standard Time' },
+      end: { dateTime: '2026-08-16T00:00:00', timeZone: 'W. Europe Standard Time' },
+    });
+    expect(text).toContain('all day on 2026-08-15');
+  });
+
+  test('converting to all-day without a date is refused', async () => {
+    const { text, of } = await call(
+      'update-event',
+      { eventId: 'evt1', allDay: true },
+      on('GET', 'me/events/evt1', SINGLE),
+    );
+    expect(text).toContain('date-only start');
+    expect(of('PATCH')).toHaveLength(0);
+  });
+
+  test('converting to timed needs both new times, and names the missing one', async () => {
+    const { text, of } = await call(
+      'update-event',
+      { eventId: 'ad1', allDay: false, start: '2026-08-15T09:00:00' },
+      on('GET', 'me/events/ad1', ALLDAY),
+    );
+    expect(text).toContain('also pass end');
+    expect(of('PATCH')).toHaveLength(0);
+  });
+
+  test('converting to timed patches the flip and both boundaries together', async () => {
+    const { of } = await call(
+      'update-event',
+      { eventId: 'ad1', allDay: false, start: '2026-08-15T09:00:00', end: '2026-08-15T10:00:00' },
+      on('GET', 'me/events/ad1', ALLDAY),
+      on('PATCH', 'me/events/ad1', {}),
+    );
+    expect(of('PATCH')[0]?.body).toEqual({
+      isAllDay: false,
+      start: { dateTime: '2026-08-15T09:00:00', timeZone: 'W. Europe Standard Time' },
+      end: { dateTime: '2026-08-15T10:00:00', timeZone: 'W. Europe Standard Time' },
+    });
+  });
+
+  test('moving one boundary of an all-day event keeps the other as stored', async () => {
+    const { of } = await call(
+      'update-event',
+      { eventId: 'ad1', start: '2026-08-14' },
+      (c) =>
+        c.method === 'GET' && c.query?.['$select'] === 'start,end'
+          ? {
+              start: { dateTime: '2026-08-15T00:00:00' },
+              end: { dateTime: '2026-08-17T00:00:00' },
+            }
+          : undefined,
+      on('GET', 'me/events/ad1', ALLDAY),
+      on('PATCH', 'me/events/ad1', {}),
+    );
+    // Stored span was 15..16 inclusive; the new start extends it to 14..16.
+    expect(of('PATCH')[0]?.body).toMatchObject({
+      isAllDay: true,
+      start: { dateTime: '2026-08-14T00:00:00' },
+      end: { dateTime: '2026-08-17T00:00:00' },
+    });
+  });
+
+  test('a time-bearing edit of an all-day event is refused without allDay:false', async () => {
+    const { text, of } = await call(
+      'update-event',
+      { eventId: 'ad1', start: '2026-08-15T09:00:00' },
+      on('GET', 'me/events/ad1', ALLDAY),
+    );
+    expect(text).toContain('date-only');
+    expect(of('PATCH')).toHaveLength(0);
+  });
+});
+
 describe('the tool set', () => {
   test('every tool declares scopes, schemas and a renderer', () => {
     for (const definition of calendarTools) {

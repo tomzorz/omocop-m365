@@ -22,7 +22,7 @@ Calendar:
 | `list-calendars`, `list-events` | `Calendars.Read` |
 | `create-event`, `update-event`, `delete-event`, `cancel-event`, `accept-event`, `decline-event` | `Calendars.ReadWrite` |
 
-Calendars are addressed by name, with unambiguous-prefix matching. Events that recur need an explicit `scope` ("this occurrence" or "the series") before anything destructive happens; a call without one fails and explains both options.
+Calendars are addressed by name, with unambiguous-prefix matching. Times without an offset land in the configured timezone or a per-event `timeZone`; a timestamp carrying `Z` or an offset is honoured as that exact instant. All-day events take date-only values with an inclusive end, and `showAs` covers free/busy. Events that recur need an explicit `scope` ("this occurrence" or "the series") before anything destructive happens; a call without one fails and explains both options.
 
 Mail:
 

@@ -312,6 +312,19 @@ describe('pagination', () => {
     expect(f.calls[1]?.url).toBe('https://graph.test/page2');
   });
 
+  test('a Prefer header rides along to every page, not just the first', async () => {
+    const f = fakeFetch([
+      { status: 200, bodyText: '{"value":[1],"@odata.nextLink":"https://graph.test/page2"}' },
+      { status: 200, bodyText: '{"value":[2]}' },
+    ]);
+
+    await client(f.impl).collect<number>('me/events', {}, Infinity, { Prefer: 'outlook.timezone="UTC"' });
+
+    for (const call of f.calls) {
+      expect((call.init.headers as Record<string, string>)['Prefer']).toBe('outlook.timezone="UTC"');
+    }
+  });
+
   test('stops at the limit and reports truncation', async () => {
     const f = fakeFetch([
       { status: 200, bodyText: '{"value":[1,2,3],"@odata.nextLink":"https://graph.test/p2"}' },

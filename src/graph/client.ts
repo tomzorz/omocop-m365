@@ -207,8 +207,16 @@ export class GraphClient {
     }
   }
 
-  get<T = unknown>(path: string, query?: Record<string, QueryValue>): Promise<T> {
-    return this.json<T>(path, { method: 'GET', ...(query ? { query } : {}) });
+  get<T = unknown>(
+    path: string,
+    query?: Record<string, QueryValue>,
+    headers?: Record<string, string>,
+  ): Promise<T> {
+    return this.json<T>(path, {
+      method: 'GET',
+      ...(query ? { query } : {}),
+      ...(headers ? { headers } : {}),
+    });
   }
 
   post<T = unknown>(path: string, body?: unknown): Promise<T> {
@@ -234,6 +242,7 @@ export class GraphClient {
     path: string,
     query: Record<string, QueryValue> = {},
     limit = Infinity,
+    headers?: Record<string, string>,
   ): Promise<{ items: T[]; truncated: boolean }> {
     const items: T[] = [];
     let next: string | undefined;
@@ -244,8 +253,9 @@ export class GraphClient {
         ? await this.json<{ value?: T[]; '@odata.nextLink'?: string }>(path, {
             method: 'GET',
             query,
+            ...(headers ? { headers } : {}),
           })
-        : await this.followNextLink<T>(next as string);
+        : await this.followNextLink<T>(next as string, headers);
       first = false;
 
       items.push(...(page.value ?? []));
@@ -258,8 +268,11 @@ export class GraphClient {
 
   private async followNextLink<T>(
     url: string,
+    headers?: Record<string, string>,
   ): Promise<{ value?: T[]; '@odata.nextLink'?: string }> {
-    const response = await this.send('', { method: 'GET' }, url);
+    // A Prefer header shapes what Graph returns, so it must ride along to every
+    // page — page two answering in a different zone than page one is a bug.
+    const response = await this.send('', { method: 'GET', ...(headers ? { headers } : {}) }, url);
     // Same parse-and-translate as the first page: a proxy can hand back a
     // non-JSON 200 on any page, and page two must not fail with a different
     // error shape than page one would.
