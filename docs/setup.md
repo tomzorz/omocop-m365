@@ -74,8 +74,7 @@ For **Claude Code**, either `claude mcp add omocop-m365 --env ... -- node <path>
   "command": "node",
   "args": ["/absolute/path/to/omocop-m365/dist/index.js"],
   "env": {
-    "M365_CLIENT_ID": "your-client-id",
-    "M365_TIMEZONE": "W. Europe Standard Time"
+    "M365_CLIENT_ID": "your-client-id"
   }
 }
 ```
@@ -86,7 +85,7 @@ Restart the client after editing; verify with the `check-auth-status` tool, whic
 
 Two notes:
 
-- `M365_TIMEZONE` is a Windows timezone name (`"W. Europe Standard Time"`), not an IANA one (`Europe/Budapest` will not work). It governs what naive timestamps like `2026-08-15T14:00:00` mean.
+- The timezone follows the host by default, so the MCP server and the CLI agree without either being told. `M365_TIMEZONE` overrides it, as an IANA name (`Europe/Budapest`) or a Windows one (`W. Europe Standard Time`); Graph accepts both. It governs what naive timestamps like `2026-08-15T14:00:00` mean and which zone event times come back in.
 - The registration key (`omocop-m365` above) namespaces the tool names: `mcp__omocop-m365__list-events`. Anything that references tool names by string, such as permission allowlists or a skill's `allowed-tools` frontmatter, silently stops matching if you register under a different key. This is why the shipped skills deliberately omit `allowed-tools`.
 
 ## 5. Install the skills

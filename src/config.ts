@@ -50,7 +50,11 @@ export interface Config {
   readonly tenantId: string;
   readonly authority: string;
   readonly scopes: readonly string[];
-  /** Windows timezone name applied to naive timestamps, e.g. "W. Europe Standard Time". */
+  /**
+   * Timezone applied to naive timestamps and requested for event times in
+   * responses. An IANA name ("Europe/Budapest") or a Windows one ("W. Europe
+   * Standard Time"); Graph accepts both. Defaults to the host's zone.
+   */
   readonly timezone: string;
   readonly tokenStorePath: string;
   readonly authPort: number;
@@ -71,6 +75,16 @@ function read(env: Env, name: string): string | undefined {
 
 const booleanish = (value: string | undefined): boolean =>
   value !== undefined && ['1', 'true', 'yes', 'on'].includes(value.trim().toLowerCase());
+
+/**
+ * The zone the host is set to, as an IANA name. Two registrations of this
+ * server on one machine (MCP and CLI) each carried their own copy of the
+ * zone and drifted apart; the OS setting is the one copy they can share.
+ * ICU can report an empty string on a host with no zone data, hence UTC.
+ */
+export function hostTimezone(): string {
+  return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+}
 
 /**
  * Builds the configuration, or throws with a message that says what to do.
@@ -121,7 +135,7 @@ export function loadConfig(env: Env = process.env): Config {
     // Personal Microsoft accounts have no tenant of their own and use 'common'.
     authority: `https://login.microsoftonline.com/${tenantId || 'common'}`,
     scopes,
-    timezone: read(env, 'M365_TIMEZONE') ?? 'UTC',
+    timezone: read(env, 'M365_TIMEZONE') ?? hostTimezone(),
     tokenStorePath:
       read(env, 'M365_TOKEN_STORE') ?? join(homedir(), '.omocop-m365-tokens.json'),
     authPort: parsedPort.data,

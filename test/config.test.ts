@@ -86,13 +86,20 @@ describe('authority', () => {
 });
 
 describe('other settings', () => {
-  test('defaults the timezone to UTC rather than guessing the host', () => {
-    expect(loadConfig(MINIMAL).timezone).toBe('UTC');
+  test('defaults the timezone to the host zone', () => {
+    const host = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    expect(loadConfig(MINIMAL).timezone).toBe(host);
+    expect(loadConfig(MINIMAL).timezone).not.toBe('');
   });
 
   test('accepts a Windows timezone name', () => {
     expect(loadConfig({ ...MINIMAL, M365_TIMEZONE: 'W. Europe Standard Time' }).timezone)
       .toBe('W. Europe Standard Time');
+  });
+
+  test('accepts an IANA timezone name', () => {
+    expect(loadConfig({ ...MINIMAL, M365_TIMEZONE: 'Europe/Budapest' }).timezone)
+      .toBe('Europe/Budapest');
   });
 
   test('token store defaults under the home directory', () => {
