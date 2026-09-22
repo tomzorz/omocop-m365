@@ -182,9 +182,8 @@ describe('refresh', () => {
   });
 
   /**
-   * Two concurrent 401s must not start two exchanges: Entra invalidates the old
-   * refresh token when it issues a new one, so the loser of the race can leave a
-   * dead credential on disk.
+   * Two concurrent 401s share one exchange, so every caller ends up holding the
+   * tokens that were written to disk rather than one of several parallel sets.
    */
   test('collapses concurrent refreshes onto one request', async () => {
     await writeFile(config.tokenStorePath, JSON.stringify(validTokens({ expiresAt: clock })));
@@ -234,8 +233,9 @@ describe('refresh', () => {
 
 /**
  * The token file is shared: `npm run auth` and any second server instance write
- * the same path, and Entra invalidates a refresh token when it rotates it. The
- * store must treat disk, not memory, as the source of truth around a refresh.
+ * the same path, and a fresh sign-in replaces a credential that may have been
+ * revoked. The store must treat disk, not memory, as the source of truth around
+ * a refresh.
  */
 describe('multi-process coordination', () => {
   test('adopts tokens another process refreshed and skips the exchange', async () => {
@@ -269,17 +269,17 @@ describe('multi-process coordination', () => {
 
     expect(await store.getAccessToken()).toBe('access-3');
     expect(endpoint.calls()).toBe(1);
-    // The exchange must use the rotated token — the in-memory one is dead.
+    // The exchange must use the token on disk; the in-memory one may be revoked.
     expect(endpoint.bodies[0]).toContain('refresh_token=refresh-2');
   });
 
-  test('retries an invalid_grant once with a refresh token rotated on disk mid-flight', async () => {
+  test('retries an invalid_grant once with a refresh token written to disk mid-flight', async () => {
     await writeFile(config.tokenStorePath, JSON.stringify(validTokens({ expiresAt: clock })));
 
     const bodies: string[] = [];
     let calls = 0;
-    // The other process wins the rotation race after this store's pre-read:
-    // its write lands while our exchange is already on the wire.
+    // A sign-in in another process lands after this store's pre-read, while
+    // our exchange with the revoked token is already on the wire.
     const impl = (async (_url: unknown, init?: RequestInit) => {
       calls += 1;
       bodies.push(String(init?.body ?? ''));

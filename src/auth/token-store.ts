@@ -3,10 +3,10 @@
  *
  * Three things here are load-bearing.
  *
- * **One refresh at a time.** Two concurrent 401s must not start two refreshes:
- * Entra invalidates the old refresh token when it issues a new one, so the second
- * exchange races the first and can leave the stored credential dead. A single
- * in-flight promise, shared by every caller, is the whole fix.
+ * **One refresh at a time.** Two concurrent 401s share one exchange rather than
+ * starting two. Not for safety: Entra does not revoke a refresh token when it is
+ * redeemed, so parallel exchanges would each succeed. For economy, and so every
+ * caller ends up holding the same tokens as the file.
  *
  * **Granted scopes come from the token response, not from the request.** Asking
  * for a scope is not being given it. The token endpoint reports what was actually
@@ -15,11 +15,17 @@
  * **Nothing here logs token material.** The logger redacts as a backstop, but the
  * rule is that this module does not pass tokens to it in the first place.
  *
- * **The token file is shared with other processes.** `npm run auth` and any
- * second server instance write the same file, and Entra invalidates the old
- * refresh token when it rotates one. So: a refresh re-reads disk before
- * exchanging, an invalid_grant is retried once with whatever token is on disk,
- * writes are write-then-rename so a crash cannot truncate the store, and
+ * **The token file is shared with other processes.** `npm run auth`, the CLI and
+ * any second server instance write the same file. Several processes refreshing
+ * independently is harmless: "The Microsoft identity platform doesn't revoke old
+ * refresh tokens when used to fetch new access tokens"
+ * (https://learn.microsoft.com/entra/identity-platform/refresh-tokens), and
+ * redeeming one token from two processes at once was checked against a live
+ * account. What the sharing does need: a refresh re-reads disk before
+ * exchanging, so a fresh sign-in or another process's refresh is picked up
+ * instead of a token that may since have been revoked; an invalid_grant is
+ * retried once with whatever is on disk, for a sign-in that lands mid-exchange;
+ * writes are write-then-rename so a crash cannot truncate the store; and
  * "not authenticated" is never memoised past the failure that discovered it.
  */
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
@@ -199,10 +205,10 @@ export class TokenStore implements TokenProvider {
       let current = await this.load();
       if (!current) throw this.authRequired();
 
-      // Another process sharing this file may have refreshed moments ago, and
-      // Entra invalidates the old refresh token on rotation — exchanging the
-      // in-memory one after a rotation elsewhere kills the stored credential.
-      // Disk is re-read inside the critical section so the rotated tokens win.
+      // Another process sharing this file may have refreshed moments ago, or a
+      // fresh sign-in may have replaced a revoked credential. Disk is re-read
+      // inside the critical section so the newer tokens win, and a still-valid
+      // access token from elsewhere saves the exchange entirely.
       const onDisk = await this.readFromDisk();
       if (
         onDisk &&
@@ -220,10 +226,9 @@ export class TokenStore implements TokenProvider {
       let outcome = await this.exchange(current.refreshToken);
 
       if (!outcome.ok && outcome.payload.error === 'invalid_grant') {
-        // invalid_grant usually means spent or revoked — but when another
-        // process rotated the token between our disk read and the POST, the
-        // rotated token is on disk now and is worth exactly one retry before
-        // demanding a fresh sign-in.
+        // invalid_grant means revoked or expired — but when a sign-in landed
+        // between our disk read and the POST, its token is on disk now and is
+        // worth exactly one retry before demanding a fresh sign-in.
         const latest = await this.readFromDisk();
         if (latest && latest.refreshToken !== current.refreshToken) {
           current = latest;
