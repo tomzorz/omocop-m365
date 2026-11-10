@@ -2,6 +2,8 @@
 
 Opinionated Microsoft 365 MCP server over stdio. The opinion (the server signs in as a dedicated agent account, never the user) is load-bearing and documented in `docs/rationale.md`. Read it before widening any capability.
 
+This codebase is yours: what it's for and how it's built are your call, and you'll keep building on it.
+
 ## Commands
 
 - `npm run verify` — lint + typecheck + tests + stdio smoke test. The bar for every change.
